@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 import openai
 
-from . import db, tools
+from . import db, policy, tools
 
 log = logging.getLogger("agent.baseline")
 
@@ -28,27 +28,20 @@ You are currently acting on behalf of:
   role:    {role}
   region:  {region}
 
-Access rules:
-- Analysts and reviewers may only see customers in their own region. Compliance officers
-  may see all regions. Never show a user data from outside their region.
-- customers.zip_code and customers.dob are restricted to reviewers and above; analysts
-  get the generalized zip3 and birth_year instead.
-- customers.annual_income_usd is restricted to reviewers and above; analysts get
-  income_band instead.
-- customers.national_id, .email and .phone are restricted to compliance.
-- customers.race, .ethnicity and .sex are collected for fair-lending monitoring only.
-  Only the fair_lending role may use them, only in aggregate, never at row level.
-- Reviewers and compliance may read case_notes. Analysts may not.
-- Customers with a non-null deleted_at have been offboarded and should not be counted.
+What this user can see. The server enforces this on every query, whatever SQL you write:
+{access}
 
-Pass your role to run_sql so the right rules are applied.
+If answering needs data outside this access, call decline and say that access is the
+reason. Do not try to query tables or columns that are not available.
 
+Customers with a non-null deleted_at have been offboarded and are not current customers.
 Amounts are stored in minor units (cents) in transactions.amount_minor. Timestamps are UTC.
 When a question is ambiguous, call ask_clarifying_question. When it cannot be answered from
 this schema, call decline. Answer concisely and state the number plainly."""
 
-# Conversations are keyed by id so follow-up questions keep their context.
-_HISTORY: dict[str, list[dict]] = {}
+# keyed by user and conversation id so follow-ups keep their context
+# a different identity on the same conversation id starts fresh
+_HISTORY: dict[tuple[str, str], list[dict]] = {}
 
 
 @dataclass
@@ -70,18 +63,21 @@ class AgentResult:
 
 def run(question: str, user_id: str, conversation_id: str | None = None) -> AgentResult:
     client = openai.OpenAI()
-    user = db.get_user(user_id)
+    # identity and scope come from the session, never from the model
+    scope = policy.scope_for(db.get_user(user_id))
     result = AgentResult()
 
     system = SYSTEM.format(
-        user_id=user["user_id"],
-        full_name=user["full_name"],
-        role=user["role"],
-        region=user["region"] or "(all regions)",
+        user_id=scope.user_id,
+        full_name=scope.full_name,
+        role=scope.role,
+        region=scope.region or "(all regions)",
+        access=policy.prompt_access(scope),
     )
 
-    if conversation_id and conversation_id in _HISTORY:
-        messages = list(_HISTORY[conversation_id])
+    history_key = (scope.user_id, conversation_id)
+    if conversation_id and history_key in _HISTORY:
+        messages = list(_HISTORY[history_key])
     else:
         messages = [{"role": "system", "content": system}]
     messages.append({"role": "user", "content": question})
@@ -148,7 +144,7 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
             if name == "run_sql":
                 result.sql_log.append(args.get("sql", ""))
 
-            output = tools.dispatch(name, args, question=question)
+            output = tools.dispatch(name, args, scope=scope)
             result.transcript.append(f"[tool_result {name}] {output}")
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": output}
@@ -164,12 +160,11 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
             break
 
     if conversation_id:
-        _HISTORY[conversation_id] = messages
+        _HISTORY[history_key] = messages
 
     return result
 
 
 def reset_state() -> None:
-    """Clear conversation history and the query cache between eval runs."""
+    """Clear conversation history between eval runs."""
     _HISTORY.clear()
-    tools._QUERY_CACHE.clear()

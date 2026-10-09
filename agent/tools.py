@@ -5,21 +5,9 @@ This is the layer between the model and the data. Read it closely.
 
 import logging
 
-from . import db
+from . import db, policy
 
 log = logging.getLogger("agent.tools")
-
-# Role ranking used to decide who may see restricted columns.
-ROLE_RANK = {"analyst": 1, "fair_lending": 1, "reviewer": 2, "compliance": 3, "admin": 99}
-
-RESTRICTED_COLUMNS = (
-    "national_id", "dob", "email", "phone",
-    "annual_income_usd", "zip_code",
-    "race", "ethnicity", "sex",
-)
-
-# Results are memoised so repeated questions are cheap.
-_QUERY_CACHE: dict[str, list[dict]] = {}
 
 
 TOOLS = [
@@ -49,20 +37,14 @@ TOOLS = [
             "name": "run_sql",
             "description": (
                 "Run a read-only SQL query against the warehouse and return the rows. "
-                "Pass the role you are currently acting on behalf of so the correct "
-                "access rules are applied."
+                "The server applies the signed-in user's access scope to every query."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "sql": {"type": "string", "description": "A single SELECT statement."},
-                    "role": {
-                        "type": "string",
-                        "description": "The role this query is being run on behalf of.",
-                        "enum": ["analyst", "reviewer", "compliance", "admin"],
-                    },
                 },
-                "required": ["sql", "role"],
+                "required": ["sql"],
             },
         },
     },
@@ -127,52 +109,48 @@ TOOLS = [
 TERMINAL_TOOLS = {"ask_clarifying_question", "decline"}
 
 
-def _run_sql(sql: str, role: str, question: str) -> str:
-    if role not in ROLE_RANK:
-        return f"error: unknown role {role!r}"
+def _run_sql(sql: str, scope: policy.Scope) -> str:
+    try:
+        rows = db.query(sql, scope)
+    except db.AccessDenied as exc:
+        log.info("user=%s denied sql=%s reason=%s", scope.user_id, sql, exc)
+        return f"access denied: {exc}"
+    except db.SQLError as exc:
+        return f"error: {exc}"
+    log.info("user=%s sql=%s rows=%d", scope.user_id, sql, len(rows))
 
-    if ROLE_RANK[role] < ROLE_RANK["compliance"]:
-        select_list = sql.lower().split(" from ")[0]
-        for col in RESTRICTED_COLUMNS:
-            if col in select_list:
-                return (
-                    f"error: permission denied on column customers.{col} — "
-                    f"role {role!r} is not cleared for it"
-                )
-
-    cache_key = question
-    if cache_key in _QUERY_CACHE:
-        rows = _QUERY_CACHE[cache_key]
-        log.info("cache hit for %r -> %s", question, rows)
-    else:
-        try:
-            rows = db.execute(sql)
-        except db.SQLError as exc:
-            return f"error: {exc}"
-        _QUERY_CACHE[cache_key] = rows
-        log.info("sql=%s rows=%s", sql, rows)
-
+    # tells the model a zero or a short list may be the scope, not the data
+    note = f"\nscope: {policy.row_scope(scope)}" if policy.row_scope(scope) else ""
     if not rows:
-        return "0 rows"
+        return "0 rows" + note
     header = " | ".join(rows[0].keys())
     body = "\n".join(" | ".join(str(v) for v in r.values()) for r in rows)
-    return f"{len(rows)} row(s)\n{header}\n{body}"
+    return f"{len(rows)} row(s)\n{header}\n{body}{note}"
 
 
-def dispatch(name: str, args: dict, *, question: str) -> str:
+def _describe_table(table: str, scope: policy.Scope) -> str:
+    create_sql = db.table_sql(table)
+    if create_sql is None:
+        return f"error: no such table {table!r}"
+    text = policy.describe(scope, table, create_sql)
+    if text is None:
+        return f"access denied: {policy.table_denied(scope, table)}"
+    return text
+
+
+def dispatch(name: str, args: dict, *, scope: policy.Scope) -> str:
     """Execute one tool call and return the result as text for the model."""
     if name == "list_tables":
-        return "users, customers, transactions, alerts, case_notes"
+        tables = ", ".join(scope.policy.tables)
+        if scope.policy.schema_only:
+            tables += f"\nschema only, not queryable: {', '.join(scope.policy.schema_only)}"
+        return tables
 
     if name == "describe_table":
-        table = args["table"]
-        for stmt in db.schema_text().split("\n\n"):
-            if f"TABLE {table}" in stmt:
-                return stmt
-        return f"error: no such table {table!r}"
+        return _describe_table(args["table"], scope)
 
     if name == "run_sql":
-        return _run_sql(args["sql"], args["role"], question)
+        return _run_sql(args["sql"], scope)
 
     if name == "make_chart":
         spec = {
