@@ -38,6 +38,26 @@ I read the two together like this. Age comes from `dob`, so a role without `dob`
 
 This is a prompt rule, generated in `policy.prompt_access` from the `GENERALIZED` map, not something the server enforces. The server can't stop arithmetic on a column the user is allowed to read.
 
+**Audit record**
+
+Every turn appends one JSON line to `audit.jsonl` (`AUDIT_PATH`), built in `agent/audit.py`. It holds:
+- the identity from the users table
+- the resolved permissions: tables, row filter, visible and withheld columns, policy fingerprint, and the view SQL that applies them
+- every tool call, with the SQL as written, the status, the refusal reason, the columns, the row count, truncation, the redactions, a summary of each floor check, and `model_saw`, the exact text that entered the model's context
+- the outcome, tokens and latency
+
+A turn that errors or crashes still leaves a record. `AgentResult.audit` is a sanitized copy for the UI. It drops the view SQL, the fingerprint, the floor-check queries and counts, and the raw tool text, and keeps the user's own scope, their queries, the rows they were shown and the outcome.
+
+| Limitation | Detail |
+|---|---|
+| The file is as sensitive as the warehouse | `model_saw` holds customer rows, including national ids on compliance turns. It's created owner-only (0600) and gitignored, but there's no encryption at rest, access control beyond the file mode, or retention policy |
+| Not tamper-evident | Anyone who can write the file can edit or delete lines. A real deployment would ship records to append-only storage and chain each record's hash to the previous one |
+| Written at the end of the turn | If the process dies between a query and the write, that turn has no record. If the write fails, the answer is withheld, but the rows were already in the model's context and sent to the model provider, whose own retention this record doesn't cover |
+| One writer per process | Appends are serialized by a lock inside one process. Several processes writing the same file rely on `O_APPEND`, and large records could interleave. One writer service would fix it |
+| It grows fast | Each query can store up to 200 rows. There's no rotation |
+| Not every input is pinned | The record doesn't store the code version or the system prompt text. The fingerprint changes when the policy changes, but a prompt change alone doesn't show up |
+| What's left out on purpose | The people behind a floor check are national ids, so only their count is kept. Floor-check queries are recorded as SQL with a decision, never their rows |
+
 **Execution and state**
 
 | Limitation | Detail |

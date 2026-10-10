@@ -4,6 +4,7 @@ This is the layer between the model and the data. Read it closely.
 """
 
 import logging
+import time
 
 from . import db, policy
 
@@ -112,19 +113,35 @@ TERMINAL_TOOLS = {"ask_clarifying_question", "decline"}
 REFUSAL_PREFIXES = ("access denied:", "unsupported:")
 
 
-def _run_sql(sql: str, scope: policy.Scope) -> str:
+def _run_sql(sql: str, scope: policy.Scope, trace: dict) -> str:
+    """trace collects the structured outcome for the audit record"""
+    trace["checks"] = []
+    started = time.monotonic()
     try:
-        result = db.query(sql, scope)
+        result = db.query(sql, scope, trace["checks"])
     except db.AccessDenied as exc:
         log.info("user=%s denied sql=%s reason=%s", scope.user_id, sql, exc)
+        trace.update(status="access_denied", reason=str(exc))
         return f"access denied: {exc}"
     except db.Unsupported as exc:
         log.info("user=%s unsupported sql=%s reason=%s", scope.user_id, sql, exc)
+        trace.update(status="unsupported", reason=str(exc))
         return f"unsupported: {exc}"
     except db.SQLError as exc:
+        trace.update(status="error", reason=str(exc))
         return f"error: {exc}"
+    finally:
+        trace["duration_ms"] = round((time.monotonic() - started) * 1000, 1)
     rows = result.rows
     log.info("user=%s sql=%s rows=%d", scope.user_id, sql, len(rows))
+    trace.update(
+        status="ok",
+        columns=list(result.columns),
+        rows=[list(r.values()) for r in rows],
+        row_count=len(rows),
+        truncated=result.truncated,
+        redactions=list(result.redactions),
+    )
 
     notes = []
     if result.truncated:
@@ -151,8 +168,12 @@ def _describe_table(table: str, scope: policy.Scope) -> str:
     return text
 
 
-def dispatch(name: str, args: dict, *, scope: policy.Scope) -> str:
-    """Execute one tool call and return the result as text for the model."""
+def dispatch(name: str, args: dict, *, scope: policy.Scope, trace: dict | None = None) -> str:
+    """Execute one tool call and return the result as text for the model.
+
+    trace, when given, is filled with the structured outcome for the audit record
+    """
+    trace = {} if trace is None else trace
     if name == "list_tables":
         tables = ", ".join(scope.policy.tables)
         if scope.policy.schema_only:
@@ -160,10 +181,12 @@ def dispatch(name: str, args: dict, *, scope: policy.Scope) -> str:
         return tables
 
     if name == "describe_table":
-        return _describe_table(args["table"], scope)
+        out = _describe_table(args["table"], scope)
+        trace["status"] = "access_denied" if out.startswith("access denied") else "ok"
+        return out
 
     if name == "run_sql":
-        return _run_sql(args["sql"], scope)
+        return _run_sql(args["sql"], scope, trace)
 
     if name == "make_chart":
         spec = {

@@ -4,3 +4,4 @@ __pycache__/
 fraud.db
 .env
 .venv/
+audit.jsonl

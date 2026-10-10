@@ -28,6 +28,8 @@ class SQLError(Exception):
 @dataclass
 class QueryResult:
     rows: list[dict]
+    # column names, also known when no rows came back
+    columns: list[str] = field(default_factory=list)
     # more than MAX_ROWS rows matched
     truncated: bool = False
     # disclosure rules applied to these rows, for example suppressed cells
@@ -150,13 +152,14 @@ def _execute(
     return names, [tuple(r) for r in rows[:MAX_ROWS]], len(rows) > MAX_ROWS
 
 
-def query(sql: str, scope: policy.Scope) -> QueryResult:
+def query(sql: str, scope: policy.Scope, checks: list | None = None) -> QueryResult:
     """run model-written SQL inside the user's scope
 
     the connection is read-only
     each table the scope allows is shadowed by a temp view that already filters rows and drops columns
     the authorizer refuses everything else, raw main.<table> reads, other tables, writes, PRAGMA, ATTACH
     disclosure.plan then applies the aggregate floors to anything that read customers
+    checks, when given, collects a summary of each floor check for the audit record, counts only
     """
     # a filter that can only match rows outside the scope gets a refusal, not an empty result
     reason = disclosure.out_of_scope_filter(sql, scope)
@@ -183,11 +186,27 @@ def query(sql: str, scope: policy.Scope) -> QueryResult:
                     members = [r[0] for r in member_rows]
             finally:
                 check_conn.close()
-            rows, redactions = disclosure.enforce(plan, scope, rows, checked, members)
-            disclosure.audit(plan, scope, members)
+            people = [r[-2] for r in checked]
+            summary = {
+                "check": "protected_class" if plan.protected_key else "k_floor",
+                "sql": plan.check_sql,
+                "groups": len(checked),
+                "min_people": min(people) if people else 0,
+                # the people themselves are national ids, only the size is kept
+                "population": len(members) if members is not None else None,
+            }
+            if checks is not None:
+                checks.append(summary)
+            try:
+                rows, redactions = disclosure.enforce(plan, scope, rows, checked, members)
+                disclosure.audit(plan, scope, members)
+            except (AccessDenied, Unsupported) as exc:
+                summary["decision"] = f"refused: {exc}"
+                raise
+            summary["decision"] = "suppressed" if redactions else "passed"
     finally:
         conn.close()
-    return QueryResult([dict(zip(names, r)) for r in rows], truncated, redactions)
+    return QueryResult([dict(zip(names, r)) for r in rows], names, truncated, redactions)
 
 
 def table_sql(table: str) -> str | None:

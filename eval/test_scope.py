@@ -10,11 +10,12 @@ write. The isolation checks drive baseline.run with a fake model client.
 import json
 import os
 import sys
+import tempfile
 from types import SimpleNamespace as NS
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent import baseline, db, disclosure, policy, tools  # noqa: E402
+from agent import audit, baseline, db, disclosure, policy, tools  # noqa: E402
 
 DENIED = "access denied"
 UNSUPPORTED = "unsupported:"
@@ -309,6 +310,8 @@ def audit_survives_conversations() -> list[str]:
 
 def main() -> int:
     failures = 0
+    # turns driven here are tests, keep them out of the real audit log
+    audit.AUDIT_PATH = os.path.join(tempfile.mkdtemp(), "audit.jsonl")
 
     # the model has no way to name a role
     run_sql = next(t for t in tools.TOOLS if t["function"]["name"] == "run_sql")

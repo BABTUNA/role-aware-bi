@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import openai
 
-from . import db, disclosure, policy, tools
+from . import audit, db, disclosure, policy, tools
 
 log = logging.getLogger("agent.baseline")
 
@@ -81,6 +81,8 @@ class AgentResult:
     context_reset: str | None = None
     # the server's refusal, when the turn ended on one
     refusal: str | None = None
+    # the user's own view of the audit record, the full record stays server-side
+    audit: dict | None = None
 
     def called(self, name: str) -> bool:
         return any(c["name"] == name for c in self.tool_calls)
@@ -117,96 +119,123 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
     messages.append({"role": "user", "content": question})
     result.transcript.append(f"[user] {question}")
 
-    # the most recent run_sql refusal, cleared by any later run_sql that wasn't refused
-    last_refusal: str | None = None
-    for _ in range(MAX_TURNS):
-        result.turns += 1
-        try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                max_completion_tokens=MAX_TOKENS,
-                tools=tools.TOOLS,
-                messages=messages,
-            )
-        except openai.APIError as exc:
-            result.error = f"{type(exc).__name__}: {exc}"
-            return result
-
-        if response.usage:
-            result.input_tokens += response.usage.prompt_tokens
-            result.output_tokens += response.usage.completion_tokens
-
-        message = response.choices[0].message
-
-        if getattr(message, "refusal", None):
-            result.error = "model refused"
-            return result
-
-        if message.content and message.content.strip():
-            result.transcript.append(f"[assistant] {message.content}")
-
-        assistant_msg: dict = {"role": "assistant", "content": message.content}
-        if message.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id": c.id,
-                    "type": "function",
-                    "function": {"name": c.function.name, "arguments": c.function.arguments},
-                }
-                for c in message.tool_calls
-            ]
-        messages.append(assistant_msg)
-
-        if not message.tool_calls:
-            result.answer = (message.content or "").strip()
-            # the server refused and the model wrapped it in prose instead of calling decline
-            # the refusal stands, it comes from the server not from the model's choice of tool
-            if last_refusal:
-                result.declined = True
-                result.refusal = last_refusal
-            break
-
-        terminal = False
-        for call in message.tool_calls:
-            name = call.function.name
+    turn = audit.Turn(scope, question, conversation_id)
+    try:
+        # the most recent run_sql refusal, cleared by any later run_sql that wasn't refused
+        last_refusal: str | None = None
+        for _ in range(MAX_TURNS):
+            result.turns += 1
             try:
-                args = json.loads(call.function.arguments or "{}")
-            except json.JSONDecodeError:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": "error: arguments were not valid JSON",
-                })
-                continue
+                response = client.chat.completions.create(
+                    model=MODEL,
+                    max_completion_tokens=MAX_TOKENS,
+                    tools=tools.TOOLS,
+                    messages=messages,
+                )
+            except openai.APIError as exc:
+                result.error = f"{type(exc).__name__}: {exc}"
+                return result
 
-            result.tool_calls.append({"name": name, "input": args})
-            result.transcript.append(f"[tool_use {name}] {json.dumps(args)}")
+            if response.usage:
+                result.input_tokens += response.usage.prompt_tokens
+                result.output_tokens += response.usage.completion_tokens
 
-            if name == "run_sql":
-                result.sql_log.append(args.get("sql", ""))
+            message = response.choices[0].message
 
-            output = tools.dispatch(name, args, scope=scope)
-            result.transcript.append(f"[tool_result {name}] {output}")
-            if name == "run_sql":
-                last_refusal = output if output.startswith(tools.REFUSAL_PREFIXES) else None
-            messages.append(
-                {"role": "tool", "tool_call_id": call.id, "content": output}
-            )
+            if getattr(message, "refusal", None):
+                result.error = "model refused"
+                return result
 
-            if name in tools.TERMINAL_TOOLS:
-                terminal = True
-                result.answer = output
-                result.clarified = result.clarified or name == "ask_clarifying_question"
-                result.declined = result.declined or name == "decline"
+            if message.content and message.content.strip():
+                result.transcript.append(f"[assistant] {message.content}")
 
-        if terminal:
-            break
+            assistant_msg: dict = {"role": "assistant", "content": message.content}
+            if message.tool_calls:
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": c.id,
+                        "type": "function",
+                        "function": {"name": c.function.name, "arguments": c.function.arguments},
+                    }
+                    for c in message.tool_calls
+                ]
+            messages.append(assistant_msg)
 
-    if conversation_id:
-        with _LOCK:
-            _HISTORY[history_key] = messages
+            if not message.tool_calls:
+                result.answer = (message.content or "").strip()
+                # the server refused and the model wrapped it in prose instead of calling decline
+                # the refusal stands, it comes from the server not from the model's choice of tool
+                if last_refusal:
+                    result.declined = True
+                    result.refusal = last_refusal
+                break
+
+            terminal = False
+            for call in message.tool_calls:
+                name = call.function.name
+                try:
+                    args = json.loads(call.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": "error: arguments were not valid JSON",
+                    })
+                    turn.step(name, None, "error: arguments were not valid JSON", {"status": "bad_arguments"})
+                    continue
+
+                result.tool_calls.append({"name": name, "input": args})
+                result.transcript.append(f"[tool_use {name}] {json.dumps(args)}")
+
+                if name == "run_sql":
+                    result.sql_log.append(args.get("sql", ""))
+
+                trace: dict = {}
+                output = tools.dispatch(name, args, scope=scope, trace=trace)
+                turn.step(name, args, output, trace)
+                result.transcript.append(f"[tool_result {name}] {output}")
+                if name == "run_sql":
+                    last_refusal = output if output.startswith(tools.REFUSAL_PREFIXES) else None
+                messages.append(
+                    {"role": "tool", "tool_call_id": call.id, "content": output}
+                )
+
+                if name in tools.TERMINAL_TOOLS:
+                    terminal = True
+                    result.answer = output
+                    result.clarified = result.clarified or name == "ask_clarifying_question"
+                    result.declined = result.declined or name == "decline"
+
+            if terminal:
+                break
+
+        if conversation_id:
+            with _LOCK:
+                _HISTORY[history_key] = messages
+    except Exception as exc:
+        result.error = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        # every turn leaves a record, however it ended
+        _close_audit(turn, result)
 
     return result
+
+
+def _close_audit(turn: audit.Turn, result: AgentResult) -> None:
+    """write the full record server-side and hand the user their sanitized view of it
+
+    no record, no answer: if it can't be written the answer is withheld
+    """
+    record = turn.finish(result, MODEL)
+    try:
+        audit.write(record)
+    except audit.AuditWriteError as exc:
+        log.error("audit write failed for turn %s: %s", record["turn_id"], exc)
+        result.answer = ""
+        result.error = "this turn could not be recorded in the audit log, so its answer is withheld"
+        return
+    result.audit = audit.sanitize(record)
 
 
 def reset_state() -> None:
