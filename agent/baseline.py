@@ -52,6 +52,9 @@ Data notes:
   plus resolved, so ask which statuses count.
 - Timestamps are UTC. The warehouse has no notion of today, so relative dates like
   yesterday, last week or this month are ambiguous. Ask for the dates.
+- To chart something, run the query in this turn, then call make_chart with two of its
+  column names. The user also sees the query results as a table, but the answer itself
+  must still state every number the question asks for.
 
 When a question is ambiguous, call ask_clarifying_question. When it cannot be answered from
 this schema, call decline. If any part of a question can't be answered at all, decline
@@ -123,6 +126,8 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
     try:
         # the most recent run_sql refusal, cleared by any later run_sql that wasn't refused
         last_refusal: str | None = None
+        # this turn's last successful run_sql, the only data make_chart may plot
+        last_result: dict | None = None
         for _ in range(MAX_TURNS):
             result.turns += 1
             try:
@@ -191,11 +196,13 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
                     result.sql_log.append(args.get("sql", ""))
 
                 trace: dict = {}
-                output = tools.dispatch(name, args, scope=scope, trace=trace)
+                output = tools.dispatch(name, args, scope=scope, trace=trace, last_result=last_result)
                 turn.step(name, args, output, trace)
                 result.transcript.append(f"[tool_result {name}] {output}")
                 if name == "run_sql":
                     last_refusal = output if output.startswith(tools.REFUSAL_PREFIXES) else None
+                    if trace.get("status") == "ok":
+                        last_result = trace
                 messages.append(
                     {"role": "tool", "tool_call_id": call.id, "content": output}
                 )

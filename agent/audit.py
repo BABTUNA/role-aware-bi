@@ -29,6 +29,11 @@ class AuditWriteError(Exception):
     """the record could not be written, the turn's answer is withheld"""
 
 
+def public_scope(scope: policy.Scope) -> dict:
+    """the permissions a user may see about themselves, without the SQL that applies them"""
+    return {k: v for k, v in authority(scope).items() if k not in ("views", "policy_fingerprint")}
+
+
 def authority(scope: policy.Scope) -> dict:
     """the resolved permissions a turn ran under, including the SQL that applies them"""
     p = scope.policy
@@ -79,10 +84,11 @@ class Turn:
                 duration_ms=trace.get("duration_ms"),
             )
         elif name == "make_chart":
-            # the plotted rows are already in model_saw, keep the encoding readable here
+            # the spec's data comes from the turn's last authorized result, never from the model
             args = args or {}
             step["args"] = {k: args.get(k) for k in ("mark", "x_field", "y_field", "title")}
-            step["row_count"] = len(args.get("rows") or [])
+            step["reason"] = trace.get("reason")
+            step["chart"] = trace.get("chart")
         else:
             step["args"] = args
         # the exact text that entered the model's context
@@ -145,6 +151,8 @@ def sanitize(record: dict) -> dict:
             out.update({k: s.get(k) for k in _USER_STEP_FIELDS})
         elif s["tool"] == "describe_table":
             out["table"] = (s.get("args") or {}).get("table")
+        elif s["tool"] == "make_chart":
+            out.update(args=s.get("args"), reason=s.get("reason"), chart=s.get("chart"))
         elif "args" in s:
             out["args"] = s["args"]
         steps.append(out)

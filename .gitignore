@@ -5,3 +5,5 @@ fraud.db
 .env
 .venv/
 audit.jsonl
+web/node_modules/
+web/dist/

@@ -6,7 +6,7 @@ This is the layer between the model and the data. Read it closely.
 import logging
 import time
 
-from . import db, policy
+from . import charts, db, policy
 
 log = logging.getLogger("agent.tools")
 
@@ -54,23 +54,19 @@ TOOLS = [
         "function": {
             "name": "make_chart",
             "description": (
-                "Render a chart. Returns a Vega-Lite spec — do not attempt to draw the "
-                "chart yourself. Pass the rows you want plotted."
+                "Chart the result of the most recent successful run_sql in this turn. "
+                "The server builds the chart from that result, so run the query first in "
+                "the same turn and name two of its columns. Don't pass any data."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "mark": {"type": "string", "enum": ["bar", "line", "point"]},
-                    "x_field": {"type": "string"},
-                    "y_field": {"type": "string"},
+                    "x_field": {"type": "string", "description": "A column of the last result."},
+                    "y_field": {"type": "string", "description": "A numeric column of the last result."},
                     "title": {"type": "string"},
-                    "rows": {
-                        "type": "array",
-                        "description": "The data to plot, as a list of objects.",
-                        "items": {"type": "object"},
-                    },
                 },
-                "required": ["mark", "x_field", "y_field", "rows"],
+                "required": ["mark", "x_field", "y_field"],
             },
         },
     },
@@ -100,7 +96,17 @@ TOOLS = [
             ),
             "parameters": {
                 "type": "object",
-                "properties": {"reason": {"type": "string"}},
+                "properties": {
+                    "reason": {"type": "string"},
+                    "because": {
+                        "type": "string",
+                        "enum": ["access", "unavailable"],
+                        "description": (
+                            "access when the user's permissions are the reason, unavailable when "
+                            "the data doesn't exist or can't be computed. Shown to the user as a label."
+                        ),
+                    },
+                },
                 "required": ["reason"],
             },
         },
@@ -168,10 +174,14 @@ def _describe_table(table: str, scope: policy.Scope) -> str:
     return text
 
 
-def dispatch(name: str, args: dict, *, scope: policy.Scope, trace: dict | None = None) -> str:
+def dispatch(
+    name: str, args: dict, *, scope: policy.Scope, trace: dict | None = None,
+    last_result: dict | None = None,
+) -> str:
     """Execute one tool call and return the result as text for the model.
 
     trace, when given, is filled with the structured outcome for the audit record
+    last_result is the trace of this turn's last successful run_sql, the only data make_chart uses
     """
     trace = {} if trace is None else trace
     if name == "list_tables":
@@ -189,17 +199,18 @@ def dispatch(name: str, args: dict, *, scope: policy.Scope, trace: dict | None =
         return _run_sql(args["sql"], scope, trace)
 
     if name == "make_chart":
-        spec = {
-            "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-            "title": args.get("title", ""),
-            "mark": args["mark"],
-            "data": {"values": args["rows"]},
-            "encoding": {
-                "x": {"field": args["x_field"], "type": "nominal"},
-                "y": {"field": args["y_field"], "type": "quantitative"},
-            },
-        }
-        return f"chart rendered: {spec}"
+        try:
+            spec, notes = charts.build(
+                args.get("mark"), args.get("x_field"), args.get("y_field"), args.get("title"),
+                last_result,
+            )
+        except charts.ChartError as exc:
+            trace.update(status="error", reason=str(exc))
+            return f"error: {exc}"
+        trace.update(status="ok", chart=spec, points=len(spec["data"]["values"]))
+        summary = f"chart ready: {args.get('mark')} of {args.get('y_field')} by {args.get('x_field')}, "
+        summary += f"{len(spec['data']['values'])} points"
+        return summary + "".join(f"\n{n}" for n in notes)
 
     if name == "ask_clarifying_question":
         return args["question"]

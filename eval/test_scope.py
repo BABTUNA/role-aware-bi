@@ -360,12 +360,12 @@ def main() -> int:
             print(f"pass  sequence: {name}")
     disclosure.reset_audit()
 
-    audit = audit_survives_conversations()
-    for f in audit:
+    kept = audit_survives_conversations()
+    for f in kept:
         print(f"FAIL  audit: {f}")
-    if not audit:
+    if not kept:
         print("pass  audit: a new conversation keeps the record of answered populations")
-    failures += len(audit)
+    failures += len(kept)
 
     for gap in known_gaps():
         print(f"gap   {gap}")

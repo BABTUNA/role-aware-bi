@@ -8,6 +8,7 @@ anything the user wasn't shown, and the sanitized view must hold nothing interna
 """
 
 import json
+import logging
 import os
 import stat
 import sys
@@ -146,13 +147,17 @@ def check_sanitized(path: str) -> list[str]:
 
 def check_fail_closed() -> list[str]:
     real = audit.AUDIT_PATH
+    # the failed write is logged as an error on purpose, keep it out of the test output
+    logger = logging.getLogger("agent.baseline")
     with tempfile.TemporaryDirectory() as d:
         # a directory can't be opened for append
         audit.AUDIT_PATH = d
+        logger.disabled = True
         try:
             r = drive("u_ana", ["SELECT count(*) AS n FROM customers"])
         finally:
             audit.AUDIT_PATH = real
+            logger.disabled = False
     if r.answer or not r.error or r.audit is not None:
         return [f"an unrecorded turn still answered: answer={r.answer!r} error={r.error!r}"]
     return []
