@@ -1,0 +1,85 @@
+<!doctype html>
+<!-- Architecture diagram, hand-laid SVG from the arch-diagram skill. Render: bash render.sh architecture 1560,820 -->
+<html lang="en"><head><meta charset="utf-8"><title>Role-aware BI architecture</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@100,800&family=Onest:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap">
+<style>
+  :root{
+    --ink:#0F172A;        /* text, box borders, arrows (slate 900) */
+    --paper:#F8FAFC;      /* canvas (slate 50, the app's background) */
+    --band:#EEF2F7;       /* the server process band */
+    --muted:#64748B;      /* subtitles, arrow labels */
+    --dash:#94A3B8;       /* the untrusted model */
+    --accent:#4F46E5;     /* the one accent box: security enforcement (indigo 600) */
+    --accent-ink:#4338CA; /* accent text on paper */
+    --on-accent:#FFFFFF; --on-accent-sub:#E0E7FF;
+  }
+  html,body{margin:0;background:var(--paper)}
+  svg{display:block}
+  .t{font:800 22px Archivo,sans-serif;fill:var(--ink);letter-spacing:-.02em;text-anchor:middle}
+  .s{font:400 15px Onest,sans-serif;fill:var(--muted);text-anchor:middle}
+  .l{font:500 13px "JetBrains Mono",monospace;fill:var(--muted)}
+  .box{fill:#fff;stroke:var(--ink);stroke-width:2}
+  .ext{fill:#fff;stroke:var(--dash);stroke-width:1.5;stroke-dasharray:6 5}
+  .core{fill:var(--accent);stroke:var(--ink);stroke-width:2}
+  .band{fill:var(--band)}
+  .a{stroke:var(--ink);stroke-width:2;fill:none}
+</style></head><body>
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="820" viewBox="0 0 1560 820">
+  <defs><marker id="h" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#0F172A"/></marker></defs>
+
+  <text x="40" y="70" style="font:800 30px Archivo,sans-serif;letter-spacing:-.03em;fill:var(--ink)">Role-aware BI <tspan style="fill:var(--accent-ink)">architecture</tspan></text>
+
+  <!-- ROW 1 · who uses it -->
+  <rect class="box" x="120" y="130" width="340" height="90" rx="12"/>
+  <text class="t" x="290" y="169">React UI</text><text class="s" x="290" y="195">pick identity · ask · audit panel</text>
+
+  <!-- ROW 2 · the server process: session, agent, enforcement -->
+  <rect class="band" x="90" y="300" width="1380" height="200" rx="18"/>
+  <text class="l" x="780" y="326" text-anchor="middle">one Python server process</text>
+
+  <rect class="box" x="120" y="340" width="340" height="130" rx="12"/>
+  <text class="t" x="290" y="388">FastAPI</text>
+  <text class="s" x="290" y="416">identity + scope from the session</text>
+  <text class="s" x="290" y="440">one conversation per user</text>
+
+  <rect class="ext" x="610" y="340" width="340" height="130" rx="12"/>
+  <text class="t" x="780" y="388">LLM agent</text>
+  <text class="s" x="780" y="416">gpt-5.4 · untrusted · writes SQL</text>
+  <text class="s" x="780" y="440">charts from authorized rows only</text>
+
+  <rect class="core" x="1100" y="340" width="340" height="130" rx="12"/>
+  <text class="t" x="1270" y="378" style="fill:var(--on-accent)">Security enforcement</text>
+  <text class="s" x="1270" y="404" style="fill:var(--on-accent-sub)">scoped views · authorizer · read-only</text>
+  <text class="s" x="1270" y="426" style="fill:var(--on-accent-sub)">sqlglot privacy floors</text>
+  <text class="s" x="1270" y="452" style="fill:var(--on-accent);font-weight:600">unsafe queries fail closed</text>
+
+  <!-- ROW 3 · what it records and reads -->
+  <rect class="box" x="120" y="590" width="340" height="100" rx="12"/>
+  <text class="t" x="290" y="629">Audit log</text>
+  <text class="s" x="290" y="653">identity · permissions · SQL</text>
+  <text class="s" x="290" y="675">rows the model saw · redactions</text>
+
+  <rect class="box" x="1100" y="590" width="340" height="100" rx="12"/>
+  <text class="t" x="1270" y="629">SQLite warehouse</text>
+  <text class="s" x="1270" y="655">customers · transactions · alerts</text>
+
+  <!-- ARROWS -->
+  <!-- UI and server -->
+  <path class="a" d="M250 220V338" marker-end="url(#h)"/><text class="l" x="238" y="284" text-anchor="end">question</text>
+  <path class="a" d="M330 340V222" marker-end="url(#h)"/><text class="l" x="342" y="284">answer · table · chart</text>
+  <!-- session to agent and back -->
+  <path class="a" d="M460 382H608" marker-end="url(#h)"/><text class="l" x="535" y="370" text-anchor="middle">question + scope</text>
+  <path class="a" d="M610 432H462" marker-end="url(#h)"/><text class="l" x="535" y="452" text-anchor="middle">answer + chart</text>
+  <!-- agent to enforcement and back -->
+  <path class="a" d="M950 382H1098" marker-end="url(#h)"/><text class="l" x="1025" y="370" text-anchor="middle">SQL</text>
+  <path class="a" d="M1100 432H952" marker-end="url(#h)"/><text class="l" x="1025" y="452" text-anchor="middle">authorized rows</text>
+  <!-- enforcement and database -->
+  <path class="a" d="M1240 470V588" marker-end="url(#h)"/><text class="l" x="1228" y="544" text-anchor="end">read-only query</text>
+  <path class="a" d="M1300 590V472" marker-end="url(#h)"/><text class="l" x="1312" y="544">scoped rows</text>
+  <!-- every turn is recorded -->
+  <path class="a" d="M290 470V588" marker-end="url(#h)"/><text class="l" x="302" y="544">every turn</text>
+
+  <!-- the three rules -->
+  <text class="l" x="780" y="770" text-anchor="middle" style="fill:var(--ink)">the LLM never controls permissions   ·   restricted data is blocked before the model   ·   unsafe queries fail closed</text>
+</svg>
+</body></html>

@@ -1,5 +1,11 @@
 # Take-home: role-aware conversational BI
 
+![Role-aware BI architecture](docs/diagrams/architecture.png)
+
+Identity comes from a server session, the model only writes SQL, and every query goes through scoped views, an authorizer and privacy checks before any row reaches the model. The write-up is in [NOTES.md](NOTES.md). The diagram's source is [docs/diagrams/architecture.html](docs/diagrams/architecture.html).
+
+---
+
 **Time: 4-8 hours.** It is a cap, not a target.  Tell us where you stopped and why.
 
 **Use AI tooling.** Claude Code, Cursor, whatever you normally use — we do. We ask for
