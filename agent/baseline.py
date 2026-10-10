@@ -7,6 +7,7 @@ whether restricted data reached the model's context.
 
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
 
 import openai
@@ -32,16 +33,36 @@ What this user can see. The server enforces this on every query, whatever SQL yo
 {access}
 
 If answering needs data outside this access, call decline and say that access is the
-reason. Do not try to query tables or columns that are not available.
+reason. Do not try to query tables or columns that are not available. A run_sql result
+starting with "access denied:" is a refusal: call decline with that reason. One starting
+with "unsupported:" means the query shape could not be checked, so rewrite it as the
+message says, or decline.
 
-Customers with a non-null deleted_at have been offboarded and are not current customers.
-Amounts are stored in minor units (cents) in transactions.amount_minor. Timestamps are UTC.
+Data notes:
+- Customers with a non-null deleted_at have been offboarded and are not current customers.
+- transactions.amount_minor is in minor units (cents, centavos) of transactions.currency.
+  USD, EUR and MXN all appear and there is no FX table, so never add amounts in different
+  currencies together and never convert between them. When a question names a currency
+  ("in dollars", "US dollar"), filter to it and answer. When it asks for one money total
+  without naming a currency, query first: if the rows are all one currency, answer. If they
+  mix currencies, ask whether they want it per currency or for one currency.
+- "Volume" can mean a number of transactions or a sum of amounts. Ask which.
+- alerts.status is open, closed or resolved. A word that names one of those maps to it.
+  Any other word, like outstanding, pending or unresolved, could mean open alone or open
+  plus resolved, so ask which statuses count.
+- Timestamps are UTC. The warehouse has no notion of today, so relative dates like
+  yesterday, last week or this month are ambiguous. Ask for the dates.
+
 When a question is ambiguous, call ask_clarifying_question. When it cannot be answered from
-this schema, call decline. Answer concisely and state the number plainly."""
+this schema, call decline. If any part of a question can't be answered at all, decline
+instead of asking about the rest. Answer concisely and state the number plainly."""
 
-# keyed by user and conversation id so follow-ups keep their context
-# a different identity on the same conversation id starts fresh
+# keyed by scope fingerprint and conversation id so follow-ups keep their context
+# a different user, or the same user after a role or region change, never sees it
 _HISTORY: dict[tuple[str, str], list[dict]] = {}
+# conversation id and the fingerprint of the scope that started it
+_OWNER: dict[str, str] = {}
+_LOCK = threading.Lock()
 
 
 @dataclass
@@ -56,6 +77,10 @@ class AgentResult:
     input_tokens: int = 0
     output_tokens: int = 0
     error: str | None = None
+    # set when the conversation id belonged to another identity or older permissions
+    context_reset: str | None = None
+    # the server's refusal, when the turn ended on one
+    refusal: str | None = None
 
     def called(self, name: str) -> bool:
         return any(c["name"] == name for c in self.tool_calls)
@@ -75,14 +100,25 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
         access=policy.prompt_access(scope),
     )
 
-    history_key = (scope.user_id, conversation_id)
-    if conversation_id and history_key in _HISTORY:
-        messages = list(_HISTORY[history_key])
-    else:
+    history_key = (policy.fingerprint(scope), conversation_id)
+    messages = None
+    if conversation_id:
+        with _LOCK:
+            if history_key in _HISTORY:
+                messages = list(_HISTORY[history_key])
+            elif _OWNER.get(conversation_id, history_key[0]) != history_key[0]:
+                result.context_reset = (
+                    "this conversation was started by another identity or under different "
+                    "permissions, so it starts fresh"
+                )
+            _OWNER.setdefault(conversation_id, history_key[0])
+    if messages is None:
         messages = [{"role": "system", "content": system}]
     messages.append({"role": "user", "content": question})
     result.transcript.append(f"[user] {question}")
 
+    # the most recent run_sql refusal, cleared by any later run_sql that wasn't refused
+    last_refusal: str | None = None
     for _ in range(MAX_TURNS):
         result.turns += 1
         try:
@@ -123,6 +159,11 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
 
         if not message.tool_calls:
             result.answer = (message.content or "").strip()
+            # the server refused and the model wrapped it in prose instead of calling decline
+            # the refusal stands, it comes from the server not from the model's choice of tool
+            if last_refusal:
+                result.declined = True
+                result.refusal = last_refusal
             break
 
         terminal = False
@@ -146,6 +187,8 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
 
             output = tools.dispatch(name, args, scope=scope)
             result.transcript.append(f"[tool_result {name}] {output}")
+            if name == "run_sql":
+                last_refusal = output if output.startswith(tools.REFUSAL_PREFIXES) else None
             messages.append(
                 {"role": "tool", "tool_call_id": call.id, "content": output}
             )
@@ -160,11 +203,14 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
             break
 
     if conversation_id:
-        _HISTORY[history_key] = messages
+        with _LOCK:
+            _HISTORY[history_key] = messages
 
     return result
 
 
 def reset_state() -> None:
     """Clear conversation history between eval runs."""
-    _HISTORY.clear()
+    with _LOCK:
+        _HISTORY.clear()
+        _OWNER.clear()

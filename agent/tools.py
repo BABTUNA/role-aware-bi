@@ -108,24 +108,37 @@ TOOLS = [
 
 TERMINAL_TOOLS = {"ask_clarifying_question", "decline"}
 
+# run_sql results that are a refusal from the server rather than data or an error
+REFUSAL_PREFIXES = ("access denied:", "unsupported:")
+
 
 def _run_sql(sql: str, scope: policy.Scope) -> str:
     try:
-        rows = db.query(sql, scope)
+        result = db.query(sql, scope)
     except db.AccessDenied as exc:
         log.info("user=%s denied sql=%s reason=%s", scope.user_id, sql, exc)
         return f"access denied: {exc}"
+    except db.Unsupported as exc:
+        log.info("user=%s unsupported sql=%s reason=%s", scope.user_id, sql, exc)
+        return f"unsupported: {exc}"
     except db.SQLError as exc:
         return f"error: {exc}"
+    rows = result.rows
     log.info("user=%s sql=%s rows=%d", scope.user_id, sql, len(rows))
 
+    notes = []
+    if result.truncated:
+        notes.append(f"truncated: only the first {db.MAX_ROWS} rows are shown, more matched")
+    notes += [f"redacted: {r}" for r in result.redactions]
     # tells the model a zero or a short list may be the scope, not the data
-    note = f"\nscope: {policy.row_scope(scope)}" if policy.row_scope(scope) else ""
+    if policy.row_scope(scope):
+        notes.append(f"scope: {policy.row_scope(scope)}")
+    tail = "".join(f"\n{n}" for n in notes)
     if not rows:
-        return "0 rows" + note
+        return "0 rows" + tail
     header = " | ".join(rows[0].keys())
     body = "\n".join(" | ".join(str(v) for v in r.values()) for r in rows)
-    return f"{len(rows)} row(s)\n{header}\n{body}{note}"
+    return f"{len(rows)} row(s)\n{header}\n{body}{tail}"
 
 
 def _describe_table(table: str, scope: policy.Scope) -> str:

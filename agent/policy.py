@@ -5,6 +5,7 @@ identity comes from the users table via db.get_user, never from the model
 db.query enforces a Scope on every statement the model writes
 """
 
+import hashlib
 import re
 from dataclasses import dataclass
 
@@ -21,7 +22,30 @@ CUSTOMER_COLUMNS = T0 + T1 + T2 + T3 + T4 + T5
 # precise column and the generalized column a role without it gets instead
 GENERALIZED = {"zip_code": "zip3", "dob": "birth_year", "annual_income_usd": "income_band"}
 
+# what a role without the precise column must not rebuild from the generalized one
+REBUILT_FROM = {
+    "dob": "an age or average age from birth_year",
+    "annual_income_usd": "an income figure or an income threshold from income_band",
+    "zip_code": "a five-digit zip code from zip3",
+}
+
 ALL_TABLES = ("customers", "transactions", "alerts", "case_notes", "users")
+
+# disclosure floors from the README
+# a customer aggregate needs at least this many distinct customers behind every value
+K_MIN = 2
+# a protected-class breakdown needs this many customers in the population being broken down
+PROTECTED_POPULATION_MIN = 10
+# and this many in every reported cell, smaller cells are suppressed
+PROTECTED_CELL_MIN = 3
+
+
+class AccessDenied(Exception):
+    """the query reached outside the user's scope or below a disclosure floor"""
+
+
+class Unsupported(Exception):
+    """the query shape can't be checked against the disclosure floors, so it is refused"""
 
 
 @dataclass(frozen=True)
@@ -35,7 +59,6 @@ class Policy:
     # offboarded customers and their activity stay visible
     include_offboarded: bool = False
     # aggregates only, never one row per customer
-    # not enforced yet, it lands with the k = 2 and protected-class floors
     aggregate_only: bool = False
     # tables whose schema describe_table shows without allowing queries
     schema_only: tuple[str, ...] = ()
@@ -92,6 +115,12 @@ def scope_for(user: dict) -> Scope:
     return Scope(user["user_id"], user["full_name"], user["role"], user["region"], policy)
 
 
+def fingerprint(scope: Scope) -> str:
+    """changes whenever the user's identity or what they may see changes"""
+    raw = f"{scope.user_id}|{scope.role}|{scope.region}|{scope.policy!r}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -115,7 +144,11 @@ def views(scope: Scope) -> dict[str, str]:
     bodies = {
         "customers": f"SELECT {columns} FROM main.customers c WHERE {where}",
         "transactions": f"SELECT * FROM main.transactions WHERE customer_id IN ({in_customers})",
-        "alerts": f"SELECT * FROM main.alerts WHERE txn_id IN ({in_txns})",
+        # status is stored as open, OPEN, closed, CLOSED and resolved, the view lowercases it
+        "alerts": (
+            "SELECT alert_id, txn_id, rule_id, severity, lower(status) AS status "
+            f"FROM main.alerts WHERE txn_id IN ({in_txns})"
+        ),
         "case_notes": f"SELECT * FROM main.case_notes WHERE alert_id IN ({in_alerts})",
         "users": "SELECT * FROM main.users",
     }
@@ -163,6 +196,8 @@ def describe(scope: Scope, table: str, create_sql: str) -> str | None:
         notes = []
         if row_scope(scope) and table != "users":
             notes.append(f"-- rows: only those belonging to visible customers ({row_scope(scope)})")
+        if table == "alerts":
+            notes.append("-- status is lowercased in this view: open, closed or resolved")
         return "\n".join([create_sql] + notes)
 
     hidden = set(hidden_columns(scope))
@@ -202,8 +237,22 @@ def prompt_access(scope: Scope) -> str:
         hidden = [_hidden_note(scope, c) for c in hidden_columns(scope)]
         if hidden:
             lines.append(f"- not available: {', '.join(hidden)}")
+        for column in hidden_columns(scope):
+            if column in REBUILT_FROM and GENERALIZED[column] in p.customer_columns:
+                lines.append(
+                    f"- {column} is restricted, so never compute {REBUILT_FROM[column]}. "
+                    f"Decline, say {column} is restricted, and offer {GENERALIZED[column]} instead"
+                )
     if p.aggregate_only:
-        lines.append("- aggregate results only, never one row per customer")
+        lines.append("- aggregate results only (count, sum, avg), never one row per customer")
+    if "customers" in p.tables:
+        lines.append(f"- an aggregate over customers covering fewer than {K_MIN} customers is refused")
+    if set(T5) & set(p.customer_columns):
+        lines.append(
+            f"- a breakdown by race, ethnicity or sex groups by exactly one of them, needs at "
+            f"least {PROTECTED_POPULATION_MIN} customers, and cells under {PROTECTED_CELL_MIN} "
+            "are suppressed or the whole breakdown is refused"
+        )
     return "\n".join(lines)
 
 
