@@ -2,22 +2,29 @@
 
 ## Known limitations
 
-Enforcement lives in `agent/db.py` and `agent/policy.py`. Every query runs on a read-only SQLite connection where each table the user may see is a temp view that already filters rows and drops columns, and an authorizer refuses everything else. `agent/disclosure.py` adds the aggregate floors on top. It only accepts query shapes it can check exactly and refuses the rest. These are the gaps I know about.
+Enforcement lives in `agent/db.py` and `agent/policy.py`. Every query runs on a read-only SQLite connection where each table the user may see is a temp view that already filters rows and drops columns, and an authorizer refuses everything else. `agent/disclosure.py` adds the aggregate floors on top. It only accepts query shapes it can check exactly and refuses the rest. The floors count people, not customer records: the check runs on a second, server-only connection whose customers view also carries `national_id`, and the user's own query never runs there. For fair_lending, the server also keeps a per-user record of the populations it has already answered over. These are the gaps I know about.
 
 **Disclosure floors**
 
 | Limitation | Example | Why it's left |
 |---|---|---|
-| Differencing | As Ana: `avg(risk_score) WHERE risk_score > 40` is 65.6 over 5 customers, `> 45` is 71.5 over 4. 5 × 65.6 − 4 × 71.5 = 42, which is c002's exact score. Both queries pass k = 2 | Stopping it needs either a per-user record of every query answered (query auditing) or noise on every answer (differential privacy). Both change the product, not just the checker |
-| One person, two customer records | c001 and c008 share a national_id and dob, re-onboarded in WEST and EAST. A compliance aggregate over just those two passes k = 2 and describes one human | k counts customer records. Counting people needs entity resolution on `national_id`, which fair_lending isn't allowed to see |
+| Differencing for roles that read rows | As Ana: `avg(risk_score) WHERE risk_score > 40` is 65.6 over 5 customers, `> 45` is 71.5 over 4. 5 × 65.6 − 4 × 71.5 = 42, which is c002's exact score | Not tracked on purpose. Ana can select c002's risk score directly, so the two averages tell her nothing new |
+| Differencing for fair_lending, more than two queries | Four income sums whose populations are each 2 people apart all pass: everyone, everyone but c005 and c014, everyone but c005 and c013, everyone but c014 and c013. (A − B) + (A − C) − (A − D) is 2 × c005's income, 131,000. `eval/test_scope.py` reports this as a known gap | The record compares a new population against each earlier one, so it stops every two-query attack (L18, L19). Stopping combinations of three or more needs a full query audit or noise on answers. Both change what the role gets back |
+| The population record lives in process memory | Keyed by user, not conversation, so a new chat doesn't reset it. A restart does, and separate processes don't share it | A real deployment would store it in a table. It holds one set of people per answered fair_lending query, which grows with use |
+| Populations are compared within one kind | A race breakdown is compared with earlier race breakdowns, a plain aggregate with earlier plain aggregates. HAVING isn't part of the population | Two answers of different kinds can't be subtracted from each other. Comparing across kinds refused fair follow-ups, like income in WEST after a company-wide race breakdown |
+| Answers still count records | c8 expects 7 F and 6 M, which counts c001 and c008 twice. Only the floors count people | The README and the eval treat `customer_id` as the customer. The person key is `national_id`, so a re-onboarding under a different national_id isn't caught |
 | A transaction total can cover one customer | `sum(t.amount_minor) ... WHERE c.risk_score > 90` returns Dana's total | The README exempts transaction and alert totals as business metrics. Analysts can read those transaction rows anyway |
 | Groups of exactly 2 | An average over two customers gives either one the other's value | k = 2 comes from the README. The fixture is too small for a real k of 5 to 20 |
 | Zero is reported | `count(*) WHERE risk_score > 95` returns 0 | No customer is behind a zero, so there's nobody to identify |
-| Suppression is checked one query at a time | Race company-wide suppresses two cells that sum to 3. A second breakdown by race within segment could combine with it to pin one | Complementary suppression across queries needs the same query history as differencing |
+| Suppression is checked one query at a time | Race company-wide suppresses two cells that sum to 3 | Breakdowns must group by exactly one protected column, so a second breakdown has to change the population to say more, and the record compares populations. What's left is the multi-query case above |
 
 **Shapes refused as unsupported**
 
-Customer aggregates that use subqueries, CTEs, UNION or window functions come back as `unsupported:`. So do protected-class breakdowns that group by more than one column, filter on race, ethnicity or sex, or use HAVING, LIMIT, `*` or a GROUP BY ordinal. The model is told to rewrite the query or decline. That can turn a fair question into a refusal. A transaction total that filters customers through a subquery instead of a JOIN is refused too, because the subquery could be counting customers.
+For roles that can read rows, a query with no aggregate over customers runs whatever its shape: subqueries, UNION and `rank()` included. A subquery that only filters, or only aggregates transactions or alerts, is allowed too. What still comes back as `unsupported:` is a customer aggregate with a CTE or a subquery in FROM, an aggregate used as a window (`count(*) OVER ()`), a subquery that aggregates customers, and a UNION of aggregates. Each of those can carry a customer count past the floor or needs SQL rewriting I don't trust.
+
+fair_lending gets no subqueries, CTEs, UNION or windows in any aggregate. Even a plain filter is a leak for a role that can't read rows: `count(*) FROM customers WHERE EXISTS (SELECT 1 ... WHERE zip3 = '940' AND annual_income_usd > 100000)` comes back as 12 or 0, which is a yes or no about one person. Protected-class breakdowns must group by exactly one of race, ethnicity or sex, with no filter on them and no HAVING, LIMIT or `*`. `GROUP BY 1` is resolved to the column it names.
+
+The model is told to rewrite the query or decline, so a fair question can still end in a refusal.
 
 **Out-of-scope filters**
 
@@ -37,6 +44,7 @@ This is a prompt rule, generated in `policy.prompt_access` from the `GENERALIZED
 |---|---|
 | Resource limits | 2 s per statement, 200 rows to the model (flagged as truncated), 1 MB per value. A big sort or GROUP BY can still use a lot of memory inside the 2 s |
 | History lives in process memory | Keyed by a fingerprint of user, role, region and policy, plus conversation id, behind a lock. A restart loses it and separate processes don't share it. A real deployment would store it under the same key |
+| Floor checks cost a second connection | Every customer aggregate opens a server-only connection with its own temp views and runs one or two extra queries. That's milliseconds here and grows with the table |
 | No result cache | I deleted the question-keyed cache. If one comes back it has to be keyed by scope fingerprint, normalized SQL and data version |
 | Refusals wrapped in prose | When a turn's last `run_sql` was refused and the model answers in text instead of calling `decline`, the turn is still recorded as declined and `AgentResult.refusal` holds the server's reason. The model's text is kept as the answer, so the UI should show the server's reason and not trust the prose |
 | Free text still reaches the model | `memo`, `counterparty` and case note bodies go to roles that may read them. The planted injections can't change the role or scope anymore, but they can still steer how an answer is worded |

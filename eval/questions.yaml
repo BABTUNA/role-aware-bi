@@ -123,3 +123,18 @@
     What was my region's total transaction volume last quarter expressed in
     British pounds?
   expect: {kind: decline}
+
+# ---------------------------------------------------------------- generalized columns
+# an analyst has birth_year but not dob: questions about birth year are answered,
+# ages are declined with birth_year offered instead (see NOTES on L6)
+- id: g1
+  user: u_ana
+  question: >-
+    How many customers in my region were born before 1980?
+  expect: {kind: number, value: 2, tol: 0}
+
+- id: g2
+  user: u_ana
+  question: >-
+    What is Dana Whitfield's age?
+  expect: {kind: decline}

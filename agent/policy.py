@@ -40,6 +40,13 @@ PROTECTED_POPULATION_MIN = 10
 PROTECTED_CELL_MIN = 3
 
 
+# hidden columns on the server-only check view, never on the view a user's query runs on
+# a person key, so the floors count humans and not customer records
+PERSON_COLUMN = "__person"
+# a record key, for the record counts a user could work out themselves
+RECORD_COLUMN = "__record"
+
+
 class AccessDenied(Exception):
     """the query reached outside the user's scope or below a disclosure floor"""
 
@@ -125,8 +132,11 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def views(scope: Scope) -> dict[str, str]:
-    """one SELECT per queryable table, installed by db.query as a temp view of the same name"""
+def views(scope: Scope, person_key: bool = False) -> dict[str, str]:
+    """one SELECT per queryable table, installed by db.query as a temp view of the same name
+
+    person_key adds the hidden person and record columns, only for the server's floor checks
+    """
     p = scope.policy
     conds = []
     if p.own_region_only:
@@ -141,6 +151,8 @@ def views(scope: Scope) -> dict[str, str]:
     in_alerts = f"SELECT a.alert_id FROM main.alerts a WHERE a.txn_id IN ({in_txns})"
 
     columns = ", ".join(f"c.{col} AS {col}" for col in p.customer_columns)
+    if person_key:
+        columns += f", c.national_id AS {PERSON_COLUMN}, c.customer_id AS {RECORD_COLUMN}"
     bodies = {
         "customers": f"SELECT {columns} FROM main.customers c WHERE {where}",
         "transactions": f"SELECT * FROM main.transactions WHERE customer_id IN ({in_customers})",

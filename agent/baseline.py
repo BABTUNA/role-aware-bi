@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 
 import openai
 
-from . import db, policy, tools
+from . import db, disclosure, policy, tools
 
 log = logging.getLogger("agent.baseline")
 
@@ -214,3 +214,4 @@ def reset_state() -> None:
     with _LOCK:
         _HISTORY.clear()
         _OWNER.clear()
+    disclosure.reset_audit()

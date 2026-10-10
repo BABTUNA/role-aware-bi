@@ -14,7 +14,7 @@ from types import SimpleNamespace as NS
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent import baseline, db, policy, tools  # noqa: E402
+from agent import baseline, db, disclosure, policy, tools  # noqa: E402
 
 DENIED = "access denied"
 UNSUPPORTED = "unsupported:"
@@ -81,6 +81,17 @@ CASES = [
     ("u_ana", "SELECT a.rule_id, count(*) AS n FROM alerts a JOIN transactions t ON t.txn_id = a.txn_id JOIN customers c ON c.customer_id = t.customer_id GROUP BY a.rule_id", "R-CARD-TESTING | 1"),
     ("u_ana", "SELECT sum(t.amount_minor) AS s FROM transactions t JOIN customers c ON c.customer_id = t.customer_id WHERE c.risk_score > 90", "2900050"),
 
+    # shapes a row-level role may use, no aggregate over customers means no floor to check
+    ("u_ana", "SELECT full_name FROM customers WHERE customer_id IN (SELECT customer_id FROM transactions WHERE channel = 'wire')", "Ruth Delgado"),
+    ("u_ana", "SELECT full_name, risk_score, rank() OVER (ORDER BY risk_score DESC) AS r FROM customers", "Dana Whitfield | 91 | 1"),
+    ("u_ana", "SELECT full_name FROM customers WHERE customer_id IN (SELECT customer_id FROM transactions GROUP BY customer_id HAVING count(*) > 1)", "Priya Raman"),
+    ("u_ana", "SELECT full_name FROM customers WHERE segment = 'business' UNION SELECT full_name FROM customers WHERE risk_score > 90", "Aaron Blake"),
+    ("u_ana", "SELECT sum(amount_minor) AS s FROM transactions WHERE customer_id IN (SELECT customer_id FROM customers WHERE segment = 'business')", "\n2538000\n"),
+    # still refused: these would carry a customer count past the floor
+    ("u_ana", "SELECT full_name, (SELECT count(*) FROM customers c2 WHERE c2.zip3 = c.zip3) AS n FROM customers c", UNSUPPORTED),
+    ("u_ana", "SELECT count(*) FROM customers UNION ALL SELECT count(*) FROM customers WHERE risk_score > 90", UNSUPPORTED),
+    ("u_ana", "SELECT full_name, count(*) OVER () AS n FROM customers WHERE risk_score > 90", UNSUPPORTED),
+
     # reviewer: adds T2, T3 and case notes for its own region
     ("u_rae", "SELECT avg(annual_income_usd) AS a FROM customers", "211500"),
     ("u_rae", "SELECT count(*) AS n FROM case_notes", "\n3\n"),
@@ -92,6 +103,8 @@ CASES = [
     ("u_cora", "SELECT region, count(*) AS n FROM customers GROUP BY region", "WEST | 7"),
     ("u_cora", "SELECT national_id FROM customers WHERE customer_id = 'c008'", "NX-4417-DQ"),
     ("u_cora", "SELECT race, count(*) FROM customers GROUP BY race", DENIED),
+    # c001 and c008 are one person with two records, the floor counts people
+    ("u_cora", "SELECT avg(annual_income_usd) FROM customers WHERE national_id = 'NX-4417-DQ'", DENIED),
 
     # fair_lending: region, segment, T1, T3, T5, aggregates only, protected-class floors
     ("u_fern", "SELECT sex, count(*) AS n FROM customers GROUP BY sex", "F | 7\nM | 6"),
@@ -111,6 +124,12 @@ CASES = [
     ("u_fern", "SELECT customer_id FROM customers", DENIED),
     ("u_fern", "SELECT full_name, race FROM customers", DENIED),
     ("u_fern", "SELECT count(*) FROM transactions", DENIED),
+    ("u_fern", "SELECT race, count(*) AS n FROM customers GROUP BY 1", "White | 6"),
+    # the 1979 group is two records of one person, Dana
+    ("u_fern", "SELECT birth_year, avg(annual_income_usd) AS a FROM customers GROUP BY birth_year HAVING count(*) >= 2", DENIED),
+    # a filter subquery is a yes or no about one person for a role that can't read rows
+    ("u_fern", "SELECT count(*) FROM customers WHERE EXISTS (SELECT 1 FROM customers c2 WHERE c2.zip3 = '940' AND c2.annual_income_usd > 100000)", UNSUPPORTED),
+    ("u_fern", "SELECT count(*) FROM customers UNION SELECT count(*) FROM customers WHERE zip3 = '940'", UNSUPPORTED),
 
     # admin: users and schema only
     ("u_ops", "SELECT count(*) AS n FROM users", "n\n6"),
@@ -118,6 +137,79 @@ CASES = [
     ("u_ops", "SELECT * FROM transactions", DENIED),
     ("u_ops", "UPDATE users SET role = 'compliance'", DENIED),
 ]
+
+
+RACE_ALL = "SELECT race, count(*) AS n FROM customers GROUP BY race"
+INCOME = "SELECT avg(annual_income_usd) AS a FROM customers"
+
+# fair_lending differencing attacks, each run from an empty record of answered populations
+# user, steps of (sql, expected substring)
+SEQUENCES = [
+    ("race, then race without the one zip3 940 customer", "u_fern", [
+        (RACE_ALL, "White | 6"),
+        (RACE_ALL.replace("GROUP BY", "WHERE zip3 <> '940' GROUP BY"), DENIED),
+    ]),
+    ("the same carve-out asked first", "u_fern", [
+        (RACE_ALL.replace("GROUP BY", "WHERE zip3 <> '940' GROUP BY"), "White | 6"),
+        (RACE_ALL, DENIED),
+    ]),
+    ("the carve-out through a different column", "u_fern", [
+        (RACE_ALL, "White | 6"),
+        (RACE_ALL.replace("GROUP BY", "WHERE birth_year <> 1984 GROUP BY"), DENIED),
+    ]),
+    ("income for zip3 941, then without the 1979 customer", "u_fern", [
+        (INCOME + " WHERE zip3 = '941'", "198333"),
+        (INCOME + " WHERE zip3 = '941' AND birth_year <> 1979", DENIED),
+    ]),
+    ("grouped income, then the same grouping minus one person", "u_fern", [
+        ("SELECT segment, avg(annual_income_usd) AS a FROM customers GROUP BY segment", "business"),
+        ("SELECT segment, avg(annual_income_usd) AS a FROM customers WHERE zip3 <> '940' GROUP BY segment", DENIED),
+    ]),
+    # fair questions that must keep working
+    ("the same breakdown twice", "u_fern", [(RACE_ALL, "White | 6"), (RACE_ALL, "White | 6")]),
+    ("all segments, then one segment", "u_fern", [
+        ("SELECT segment, avg(annual_income_usd) AS a FROM customers GROUP BY segment", "business"),
+        (INCOME + " WHERE segment = 'business'", "483750"),
+    ]),
+    ("a protected breakdown, then a different one", "u_fern", [
+        (RACE_ALL, "White | 6"),
+        ("SELECT sex, count(*) AS n FROM customers GROUP BY sex", "F | 7"),
+    ]),
+    ("a protected breakdown, then income in one region", "u_fern", [
+        (RACE_ALL, "White | 6"),
+        (INCOME + " WHERE region = 'WEST'", "211500"),
+    ]),
+    # analysts can read these rows anyway, so their answers aren't tracked
+    ("an analyst's nested counts", "u_ana", [
+        ("SELECT count(*) AS n FROM customers WHERE risk_score > 40", "\n5\n"),
+        ("SELECT count(*) AS n FROM customers WHERE risk_score > 45", "\n4\n"),
+    ]),
+]
+
+
+def ask(user_id: str, sql: str) -> str:
+    return tools.dispatch("run_sql", {"sql": sql}, scope=policy.scope_for(db.get_user(user_id)))
+
+
+def known_gaps() -> list[str]:
+    """attacks the checks don't stop, reported so a change in behaviour shows up"""
+    gaps = []
+    disclosure.reset_audit()
+    # four sums whose populations are each 2 people apart, so every pair clears the record
+    # (A - B) + (A - C) - (A - D) = 2 x c005's income
+    total = "SELECT sum(annual_income_usd) AS s FROM customers"
+    sums = []
+    for where in ["", " WHERE zip3 <> '940' AND birth_year <> 1986",
+                  " WHERE zip3 <> '940' AND birth_year <> 1990", " WHERE birth_year NOT IN (1986, 1990)"]:
+        out = ask("u_fern", total + where)
+        if not out.startswith("1 row"):
+            break
+        sums.append(float(out.split("\n")[2]))
+    if len(sums) == 4:
+        a, b, c, d = sums
+        gaps.append(f"four sums pairwise 2 people apart give c005's income: {((a - b) + (a - c) - (a - d)) / 2:,.0f}")
+    disclosure.reset_audit()
+    return gaps
 
 
 class FakeModel:
@@ -197,6 +289,24 @@ def isolation_checks() -> list[str]:
     return failures
 
 
+def audit_survives_conversations() -> list[str]:
+    """the record of answered populations is per user, a new conversation doesn't clear it"""
+    real_client = baseline.openai.OpenAI
+    try:
+        baseline.reset_state()
+        baseline.openai.OpenAI = lambda: FakeModel([], [RACE_ALL])
+        baseline.run("race breakdown", "u_fern", "first")
+        baseline.openai.OpenAI = lambda: FakeModel(
+            [], [RACE_ALL.replace("GROUP BY", "WHERE zip3 <> '940' GROUP BY")])
+        r = baseline.run("race breakdown outside 940", "u_fern", "second")
+        if not r.declined:
+            return ["a carve-out in a new conversation was answered"]
+        return []
+    finally:
+        baseline.openai.OpenAI = real_client
+        baseline.reset_state()
+
+
 def main() -> int:
     failures = 0
 
@@ -207,6 +317,7 @@ def main() -> int:
         failures += 1
 
     for user_id, sql, want in CASES:
+        disclosure.reset_audit()
         scope = policy.scope_for(db.get_user(user_id))
         out = tools.dispatch("run_sql", {"sql": sql}, scope=scope)
         ok = want in out
@@ -234,6 +345,28 @@ def main() -> int:
         print("pass  isolation: history is keyed by identity and permissions")
     failures += len(isolation)
 
+    for name, user_id, steps in SEQUENCES:
+        disclosure.reset_audit()
+        for i, (sql, want) in enumerate(steps):
+            out = ask(user_id, sql)
+            if want not in out:
+                print(f"FAIL  sequence: {name}, step {i + 1} want {want!r}, got {out[:160]!r}")
+                failures += 1
+                break
+        else:
+            print(f"pass  sequence: {name}")
+    disclosure.reset_audit()
+
+    audit = audit_survives_conversations()
+    for f in audit:
+        print(f"FAIL  audit: {f}")
+    if not audit:
+        print("pass  audit: a new conversation keeps the record of answered populations")
+    failures += len(audit)
+
+    for gap in known_gaps():
+        print(f"gap   {gap}")
+
     refusal = refusal_checks()
     for f in refusal:
         print(f"FAIL  refusal: {f}")
@@ -241,7 +374,7 @@ def main() -> int:
         print("pass  refusal: a server refusal ends the turn as a decline")
     failures += len(refusal)
 
-    total = len(CASES) + 2
+    total = len(CASES) + len(SEQUENCES) + 4
     print(f"\n{total - failures}/{total} scope checks passed")
     return 1 if failures else 0
 

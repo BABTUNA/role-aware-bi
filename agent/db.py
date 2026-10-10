@@ -89,15 +89,20 @@ def _authorizer(scope: policy.Scope, denials: list, touched: set, schema_names: 
     return check
 
 
-def _open(scope: policy.Scope) -> tuple[sqlite3.Connection, dict[str, list[str]], set[str]]:
+def _open(
+    scope: policy.Scope, person_key: bool = False
+) -> tuple[sqlite3.Connection, dict[str, list[str]], set[str]]:
     """read-only connection with the scope's temp views, the columns of each view, and every
-    name in the real schema"""
+    name in the real schema
+
+    person_key adds the hidden person and record columns, only for the server's floor checks
+    """
     if not os.path.exists(DB_PATH):
         raise RuntimeError(f"{DB_PATH} not found — run `python seed.py` first.")
     conn = sqlite3.connect(pathlib.Path(DB_PATH).as_uri() + "?mode=ro", uri=True)
     conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, MAX_VALUE_BYTES)
     columns = {}
-    for name, body in policy.views(scope).items():
+    for name, body in policy.views(scope, person_key).items():
         conn.execute(f"CREATE TEMP VIEW {name} AS {body}")
         columns[name] = [r[1] for r in conn.execute(f"PRAGMA temp.table_info({name})")]
     schema_names = {r[0] for r in conn.execute("SELECT name FROM main.sqlite_master")}
@@ -105,16 +110,20 @@ def _open(scope: policy.Scope) -> tuple[sqlite3.Connection, dict[str, list[str]]
 
 
 def _execute(
-    conn: sqlite3.Connection, sql: str, scope: policy.Scope, touched: set, schema_names: set
+    conn: sqlite3.Connection, sql: str, scope: policy.Scope, touched: set, schema_names: set,
+    cap: bool = True,
 ) -> tuple[list[str], list[tuple], bool]:
-    """one statement under the authorizer and the time limit, returns columns, rows, truncated"""
+    """one statement under the authorizer and the time limit, returns columns, rows, truncated
+
+    cap=False fetches every row, only for server-side checks that never reach the model
+    """
     denials: list = []
     conn.set_authorizer(_authorizer(scope, denials, touched, schema_names))
     deadline = time.monotonic() + QUERY_TIMEOUT_S
     conn.set_progress_handler(lambda: time.monotonic() > deadline, PROGRESS_STEPS)
     try:
         cursor = conn.execute(sql)
-        rows = cursor.fetchmany(MAX_ROWS + 1)
+        rows = cursor.fetchmany(MAX_ROWS + 1) if cap else cursor.fetchall()
         names = [d[0] for d in cursor.description or []]
     except sqlite3.Error as exc:
         if denials:
@@ -136,6 +145,8 @@ def _execute(
     finally:
         conn.set_progress_handler(None, 0)
         conn.set_authorizer(None)
+    if not cap:
+        return names, [tuple(r) for r in rows], False
     return names, [tuple(r) for r in rows[:MAX_ROWS]], len(rows) > MAX_ROWS
 
 
@@ -159,12 +170,21 @@ def query(sql: str, scope: policy.Scope) -> QueryResult:
         redactions: list[str] = []
         plan = disclosure.plan(sql, scope, touched, columns)
         if plan is not None:
-            _, checked, _ = _execute(conn, plan.check_sql, scope, set(), schema_names)
-            population = None
-            if plan.population_sql:
-                _, pop_rows, _ = _execute(conn, plan.population_sql, scope, set(), schema_names)
-                population = pop_rows[0][0]
-            rows, redactions = disclosure.enforce(plan, scope, rows, checked, population)
+            # the floors count people, so the checks run on a second connection whose customers
+            # view also carries a person key, the user's own query never runs there
+            check_conn, _, _ = _open(scope, person_key=True)
+            try:
+                _, checked, _ = _execute(check_conn, plan.check_sql, scope, set(), schema_names)
+                members = None
+                if plan.protected_key or scope.policy.aggregate_only:
+                    _, member_rows, _ = _execute(
+                        check_conn, plan.members_sql, scope, set(), schema_names, cap=False
+                    )
+                    members = [r[0] for r in member_rows]
+            finally:
+                check_conn.close()
+            rows, redactions = disclosure.enforce(plan, scope, rows, checked, members)
+            disclosure.audit(plan, scope, members)
     finally:
         conn.close()
     return QueryResult([dict(zip(names, r)) for r in rows], truncated, redactions)
