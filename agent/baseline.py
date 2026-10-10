@@ -16,7 +16,8 @@ from . import audit, db, disclosure, policy, tools
 
 log = logging.getLogger("agent.baseline")
 
-MODEL = "gpt-5.5"
+# gpt-5.4 passed both suites on 5 of 5 full runs at about 45% of gpt-5.5's cost, see NOTES.md
+MODEL = "gpt-5.4"
 MAX_TOKENS = 12000
 MAX_TURNS = 12
 
@@ -31,6 +32,9 @@ You are currently acting on behalf of:
 
 What this user can see. The server enforces this on every query, whatever SQL you write:
 {access}
+
+The tables this user can query, exactly as the server exposes them:
+{schema}
 
 If answering needs data outside this access, call decline and say that access is the
 reason. Do not try to query tables or columns that are not available. A run_sql result
@@ -47,18 +51,26 @@ Data notes:
   without naming a currency, query first: if the rows are all one currency, answer. If they
   mix currencies, ask whether they want it per currency or for one currency.
 - "Volume" can mean a number of transactions or a sum of amounts. Ask which.
-- alerts.status is open, closed or resolved. A word that names one of those maps to it.
-  Any other word, like outstanding, pending or unresolved, could mean open alone or open
-  plus resolved, so ask which statuses count.
+- alerts.status is open, closed or resolved. It only says where an alert is in review, it
+  doesn't record the outcome, such as whether fraud was confirmed. A word that names a status
+  maps to it. A word for review state that isn't a status, like outstanding, pending or
+  unresolved, could mean open alone or open plus resolved, so ask which statuses count.
 - Timestamps are UTC. The warehouse has no notion of today, so relative dates like
   yesterday, last week or this month are ambiguous. Ask for the dates.
 - To chart something, run the query in this turn, then call make_chart with two of its
   column names. The user also sees the query results as a table, but the answer itself
   must still state every number the question asks for.
 
-When a question is ambiguous, call ask_clarifying_question. When it cannot be answered from
-this schema, call decline. If any part of a question can't be answered at all, decline
-instead of asking about the rest. Answer concisely and state the number plainly."""
+Asking or declining: call ask_clarifying_question only when two or more readings of the
+question can each be answered from the data and would give different results. If no reading
+can be answered from this schema, call decline instead. If only one reading fits the schema,
+answer it without asking. A question that names no time range covers all the data in scope.
+Read the schema above before asking what a word means: if it names a column or one of a
+column's listed values, use it. A measure the schema doesn't have can't be answered, even
+when a column sounds similar: the column notes say what each one measures. Decline it and
+say what is available instead.
+If any part of a question can't be answered at all, decline instead of asking about the
+rest. Answer concisely and state the number plainly."""
 
 # keyed by scope fingerprint and conversation id so follow-ups keep their context
 # a different user, or the same user after a role or region change, never sees it
@@ -103,6 +115,8 @@ def run(question: str, user_id: str, conversation_id: str | None = None) -> Agen
         role=scope.role,
         region=scope.region or "(all regions)",
         access=policy.prompt_access(scope),
+        # the same scoped text describe_table returns, so no model has to guess at columns
+        schema="\n\n".join(policy.describe(scope, t, db.table_sql(t)) for t in scope.policy.tables),
     )
 
     history_key = (policy.fingerprint(scope), conversation_id)

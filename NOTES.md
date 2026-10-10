@@ -1,70 +1,143 @@
 # NOTES
 
-## Known limitations
+Longer write-ups: [baseline review](docs/baseline.md), [frontend](docs/frontend.md), [known limitations](docs/limitations.md), [AI log with every prompt](docs/ai-log.md).
 
-Enforcement lives in `agent/db.py` and `agent/policy.py`. Every query runs on a read-only SQLite connection where each table the user may see is a temp view that already filters rows and drops columns, and an authorizer refuses everything else. `agent/disclosure.py` adds the aggregate floors on top. It only accepts query shapes it can check exactly and refuses the rest. The floors count people, not customer records: the check runs on a second, server-only connection whose customers view also carries `national_id`, and the user's own query never runs there. For fair_lending, the server also keeps a per-user record of the populations it has already answered over. These are the gaps I know about.
+## 1. Scorecard
 
-**Disclosure floors**
+`python eval/run_eval.py` with the default model (`gpt-5.4`), exit 0:
 
-| Limitation | Example | Why it's left |
-|---|---|---|
-| Differencing for roles that read rows | As Ana: `avg(risk_score) WHERE risk_score > 40` is 65.6 over 5 customers, `> 45` is 71.5 over 4. 5 × 65.6 − 4 × 71.5 = 42, which is c002's exact score | Not tracked on purpose. Ana can select c002's risk score directly, so the two averages tell her nothing new |
-| Differencing for fair_lending, more than two queries | Four income sums whose populations are each 2 people apart all pass: everyone, everyone but c005 and c014, everyone but c005 and c013, everyone but c014 and c013. (A − B) + (A − C) − (A − D) is 2 × c005's income, 131,000. `eval/test_scope.py` reports this as a known gap | The record compares a new population against each earlier one, so it stops every two-query attack (L18, L19). Stopping combinations of three or more needs a full query audit or noise on answers. Both change what the role gets back |
-| The population record lives in process memory | Keyed by user, not conversation, so a new chat doesn't reset it. A restart does, and separate processes don't share it | A real deployment would store it in a table. It holds one set of people per answered fair_lending query, which grows with use |
-| Populations are compared within one kind | A race breakdown is compared with earlier race breakdowns, a plain aggregate with earlier plain aggregates. HAVING isn't part of the population | Two answers of different kinds can't be subtracted from each other. Comparing across kinds refused fair follow-ups, like income in WEST after a company-wide race breakdown |
-| Answers still count records | c8 expects 7 F and 6 M, which counts c001 and c008 twice. Only the floors count people | The README and the eval treat `customer_id` as the customer. The person key is `national_id`, so a re-onboarding under a different national_id isn't caught |
-| A transaction total can cover one customer | `sum(t.amount_minor) ... WHERE c.risk_score > 90` returns Dana's total | The README exempts transaction and alert totals as business metrics. Analysts can read those transaction rows anyway |
-| Groups of exactly 2 | An average over two customers gives either one the other's value | k = 2 comes from the README. The fixture is too small for a real k of 5 to 20 |
-| Zero is reported | `count(*) WHERE risk_score > 95` returns 0 | No customer is behind a zero, so there's nobody to identify |
-| Suppression is checked one query at a time | Race company-wide suppresses two cells that sum to 3 | Breakdowns must group by exactly one protected column, so a second breakdown has to change the population to say more, and the record compares populations. What's left is the multi-query case above |
+```
+  correctness + calibration   20/20  (100%)
+  data access                 20/20  CLEAN
+```
 
-**Shapes refused as unsupported**
+| Suite | Result |
+|---|---|
+| Eval | 20/20 correctness (18 original plus g1, g2), 20/20 leaks (17 original plus L18 to L20) |
+| Five more full runs per model | gpt-5.4 and gpt-5.5 both 20/20 and 20/20 on every run |
+| Offline: `test_scope`, `test_audit`, `test_charts`, `test_server`, web vitest | 97/97, 6/6, 10/10, 13/13, 14/14 |
 
-For roles that can read rows, a query with no aggregate over customers runs whatever its shape: subqueries, UNION and `rank()` included. A subquery that only filters, or only aggregates transactions or alerts, is allowed too. What still comes back as `unsupported:` is a customer aggregate with a CTE or a subquery in FROM, an aggregate used as a window (`count(*) OVER ()`), a subquery that aggregates customers, and a UNION of aggregates. Each of those can carry a customer count past the floor or needs SQL rewriting I don't trust.
+The baseline scored 11/18 and 12/17.
 
-fair_lending gets no subqueries, CTEs, UNION or windows in any aggregate. Even a plain filter is a leak for a role that can't read rows: `count(*) FROM customers WHERE EXISTS (SELECT 1 ... WHERE zip3 = '940' AND annual_income_usd > 100000)` comes back as 12 or 0, which is a yes or no about one person. Protected-class breakdowns must group by exactly one of race, ethnicity or sex, with no filter on them and no HAVING, LIMIT or `*`. `GROUP BY 1` is resolved to the column it names.
+**What the number doesn't cover.** It's 40 hand-written questions over 15 customers. The number check passes if the value appears anywhere in the answer, and the leak check only looks for strings and column names, which is how the original L9 passed while leaking region counts. There are few multi-turn cases and no UI cases. Some behaviour still rests on the prompt, like calling `decline` at all, so a model change can move it. The data boundary doesn't rest on the prompt: across 774 benchmark turns on four models, no restricted value reached a model.
 
-The model is told to rewrite the query or decline, so a fair question can still end in a refusal.
+## 2. What I found
 
-**Out-of-scope filters**
+| Finding | In the eval? |
+|---|---|
+| The model chose its own role, and `ROLE_RANK` was a ladder with admin at 99 | Yes |
+| The column check only read the SELECT list, so `SELECT *`, WHERE filters and subqueries got through | Partly |
+| Rows were only scoped in the prompt | Yes |
+| The cache was keyed on question text, so one user's rows went to another | Yes, but L9 passed while leaking |
+| History was keyed on conversation id only, so a new identity kept the old context | No |
+| The DB was writable: `UPDATE users SET role='compliance'` stuck | No |
+| `make_chart` plotted rows the model made up | No |
+| Every result row was logged | No |
+| c001 and c008 are one person, so k = 2 on records can describe one human | No, I added L20 |
+| fair_lending can difference two answers into one person's race or income | No, I added L18 and L19 |
+| A plain `EXISTS` filter is a yes/no oracle for a role that can't read rows | No |
+| Out-of-scope filters returned a 0 that looked like an answer | No |
 
-`region = 'EAST'`, `region IN (...)` and `deleted_at IS NOT NULL` are refused with the scope as the reason. `region <> 'WEST'`, `region LIKE 'E%'` or `upper(region) = 'EAST'` still come back as 0. No out-of-scope rows are returned either way, so the problem is that the answer reads as "none" when the real reason is access.
+**Unfixable here.** Differencing across three or more queries still works: four income sums, each pair 2 people apart, give c005's exact income. Stopping it needs a query audit or noise on answers. Free text in memos and case notes can still steer an answer's wording, though not the data it reaches. Whatever the model sees also goes to the model provider.
 
-**Where the README and the eval disagree**
+**README versus eval.** The README says an analyst asking for age gets `birth_year`, but L6 expects a decline. I made it decline the computed age and offer `birth_year`.
 
-The README says an analyst asking for age "should get `birth_year`". L6 asks an analyst for the average age of their region and expects a decline. The baseline model answered 41.8 by computing `AVG(2026 - birth_year)`. No dob value reached it, so L6 failed only because it didn't decline.
+## 3. What I deliberately did not do
 
-I read the two together like this. Age comes from `dob`, so a role without `dob` never gets an age computed from `birth_year`, even approximately. It gets a decline that names `dob` as the restricted column and offers `birth_year` instead. That passes L6 and still points the user at the coarser column the README promises. For a single customer's age the answer is the same: a decline that offers their birth year, not a computed age. The same rule stops income thresholds being estimated from `income_band` (L15) and zip codes from `zip3`.
+- **Real login.** The identity picker stands in for it, and the server treats the choice as a session.
+- **A query audit or answer noise** for multi-query inference.
+- **General SQL rewriting.** The floor checks accept what sqlglot can check exactly and refuse the rest. The SQLite views and authorizer stay the boundary.
+- **Entity resolution beyond exact `national_id`,** and deduplicating answers. Only the floors count people.
+- **Filtering free text for injections.** The server already makes them powerless over data.
+- **Deployment pieces:** encrypted or tamper-evident audit storage, a persistent session store, a result cache, rate limits, and a Postgres row-level-security port.
+- **UI extras:** streaming, editing answers, saved conversations.
 
-This is a prompt rule, generated in `policy.prompt_access` from the `GENERALIZED` map, not something the server enforces. The server can't stop arithmetic on a column the user is allowed to read.
+## 4. Audit record
 
-**Audit record**
-
-Every turn appends one JSON line to `audit.jsonl` (`AUDIT_PATH`), built in `agent/audit.py`. It holds:
-- the identity from the users table
-- the resolved permissions: tables, row filter, visible and withheld columns, policy fingerprint, and the view SQL that applies them
-- every tool call, with the SQL as written, the status, the refusal reason, the columns, the row count, truncation, the redactions, a summary of each floor check, and `model_saw`, the exact text that entered the model's context
+Each turn appends one JSON line to `audit.jsonl` (`agent/audit.py`). It holds:
+- the identity
+- the resolved permissions, with the view SQL that applies them
+- every tool call, with its SQL, status, refusal reason, row count, truncation, redactions, a floor-check summary, and `model_saw`, the exact text the model got
 - the outcome, tokens and latency
 
-A turn that errors or crashes still leaves a record. `AgentResult.audit` is a sanitized copy for the UI. It drops the view SQL, the fingerprint, the floor-check queries and counts, and the raw tool text, and keeps the user's own scope, their queries, the rows they were shown and the outcome.
+That's where "what did the agent see, on whose authority" gets answered. Every exit writes a record, crashes included, and if the write fails the answer is withheld. The people behind a floor check are national ids, so only their count is kept. The UI gets a sanitized copy. The file is as sensitive as the warehouse and isn't tamper-evident.
 
-| Limitation | Detail |
-|---|---|
-| The file is as sensitive as the warehouse | `model_saw` holds customer rows, including national ids on compliance turns. It's created owner-only (0600) and gitignored, but there's no encryption at rest, access control beyond the file mode, or retention policy |
-| Not tamper-evident | Anyone who can write the file can edit or delete lines. A real deployment would ship records to append-only storage and chain each record's hash to the previous one |
-| Written at the end of the turn | If the process dies between a query and the write, that turn has no record. If the write fails, the answer is withheld, but the rows were already in the model's context and sent to the model provider, whose own retention this record doesn't cover |
-| One writer per process | Appends are serialized by a lock inside one process. Several processes writing the same file rely on `O_APPEND`, and large records could interleave. One writer service would fix it |
-| It grows fast | Each query can store up to 200 rows. There's no rotation |
-| Not every input is pinned | The record doesn't store the code version or the system prompt text. The fingerprint changes when the policy changes, but a prompt change alone doesn't show up |
-| What's left out on purpose | The people behind a floor check are national ids, so only their count is kept. Floor-check queries are recorded as SQL with a decision, never their rows |
+## 5. Cost and latency
 
-**Execution and state**
+Five full eval runs per model, 215 turns each, all run at the same time on the current prompt:
 
-| Limitation | Detail |
-|---|---|
-| Resource limits | 2 s per statement, 200 rows to the model (flagged as truncated), 1 MB per value. A big sort or GROUP BY can still use a lot of memory inside the 2 s |
-| History lives in process memory | Keyed by a fingerprint of user, role, region and policy, plus conversation id, behind a lock. A restart loses it and separate processes don't share it. A real deployment would store it under the same key |
-| Floor checks cost a second connection | Every customer aggregate opens a server-only connection with its own temp views and runs one or two extra queries. That's milliseconds here and grows with the table |
-| No result cache | I deleted the question-keyed cache. If one comes back it has to be keyed by scope fingerprint, normalized SQL and data version |
-| Refusals wrapped in prose | When a turn's last `run_sql` was refused and the model answers in text instead of calling `decline`, the turn is still recorded as declined and `AgentResult.refusal` holds the server's reason. The model's text is kept as the answer, so the UI should show the server's reason and not trust the prose |
-| Free text still reaches the model | `memo`, `counterparty` and case note bodies go to roles that may read them. The planted injections can't change the role or scope anymore, but they can still steer how an answer is worded |
+| Model | Correct | Leaks | p50 s | p95 s | Tokens in / out | Tool calls | $ / question | $ p95 | Full eval |
+|---|---|---|---|---|---|---|---|---|---|
+| gpt-5.5 | 5 of 5 at 20/20 | 5 of 5 at 20/20 | 2.8 | 6.4 | 2,863 / 164 | 1.22 | $0.0192 | $0.0345 | $0.83 |
+| **gpt-5.4** (default) | 5 of 5 at 20/20 | 5 of 5 at 20/20 | 1.9 | 4.0 | 2,914 / 85 | 1.29 | $0.0086 | $0.0143 | $0.37 |
+
+On the earlier prompt (two runs each), the smaller models failed:
+
+| Model | Correct | Leaks | $ / question |
+|---|---|---|---|
+| gpt-5.4-mini | 17, 16 | 19, 19 | $0.0020 |
+| gpt-5.4-nano | 16, 12 | 19, 20 | $0.0005 |
+
+Their leak failures were missed `decline` calls, not data. They never saw restricted rows, but the gate counts the missing decline.
+
+Prices are OpenAI's per million tokens: gpt-5.5 $5 in and $30 out, gpt-5.4 $2.50 and $15. The dollars are an upper bound, since cached input isn't counted. SQL is about 0.1% of a turn's time.
+
+**Getting gpt-5.4 there.** It failed c4 by asking for a date range the question didn't need, and u2 by asking instead of declining. Three general prompt changes fixed it:
+- a rule for asking versus declining
+- the user's scoped schema in the prompt, with notes on what each column measures
+- a status note that stops pointing it at questions the data can't answer
+
+None names an eval case or touches the server checks. The schema adds 600 to 750 input tokens, but it saves `describe_table` calls.
+
+**Tradeoff.** gpt-5.4 costs 45% of gpt-5.5 and is about a third faster, and it matched it on 6 of 6 runs. Going back is one line in `agent/baseline.py`.
+
+**At 100× the questions** (about $0.86 per 100 on gpt-5.4), the in-process state breaks first. Sessions, history and the fair_lending population record don't survive a restart or scale across processes. The audit file needs a single writer. Each turn holds a server thread for 2 to 4 s, so throughput is set by the thread pool and the OpenAI rate limits.
+
+**At 100× the rows,** SQLite is fine, but the 200-row cap trips more often and bigger results cost more tokens. At warehouse scale, the views and authorizer become the warehouse's own row and column security, and the sqlglot floor checks stay.
+
+## 6. AI log
+
+Built with Claude Code over one session of 28 prompts, every one listed word for word in [docs/ai-log.md](docs/ai-log.md).
+
+**I overrode it:**
+- I deferred the k = 2 floor until identity and the authorizer were right.
+- I put the floors before isolation.
+- I ruled out a general SQL rewriter.
+- I stopped the security work at two-query differencing.
+- I made the UI get a sanitized audit record.
+- I required checking exit codes and stderr instead of trusting summaries.
+- I had it fix gpt-5.4 rather than settle for gpt-5.5.
+
+**It was wrong:**
+- Its first authorizer blocked its own views.
+- It proposed a fair_lending filter rule that would have been an oracle, and caught that before shipping.
+- Three of its prompt notes misled the models: "keep it short" broke t3, a status note made gpt-5.4 ask instead of decline, and a column-matching rule made gpt-5.4 answer "credit score" with `risk_score`.
+- It committed a test file that crashed on start and reported it as passing.
+- It ran a secrets scan that read zero files.
+
+Exit-code checks and two review agents caught most of these.
+
+**The agent model was wrong in the baseline:** gpt-5.5 claimed `admin` or `compliance` whenever it was refused, answered "0 yesterday", added EUR to USD, and missed the mixed-case alert statuses.
+
+## 7. The interface
+
+Needs Python 3.10+ and Node 20.19+. Tested from a fresh clone:
+
+```bash
+pip install -r requirements.txt && python seed.py
+cp .env.example .env    # then add your key
+set -a && . ./.env && set +a && uvicorn app.server:app --port 8000
+cd web && npm install && npm run dev    # http://localhost:5173
+```
+
+**On screen:**
+- An identity picker. Switching starts a new session and conversation, clears the thread, panel and draft, and drops any answer still in flight.
+- A thread with follow-ups, tables, and charts the server builds from the last authorized result. Suppressed cells show as `<3` and stay off charts.
+- Refusals, empty results, clarifying questions and errors each look different.
+- A "What the agent did" panel: who it ran as, the permissions, every query and its status, refusals, redactions and timing.
+
+**Left off:** the raw audit, view SQL, the system prompt, streaming, editing answers. Checked at 320 to 1920 px and by keyboard.
+
+## 8. Walkthrough
+
+Recording: *(link)*.

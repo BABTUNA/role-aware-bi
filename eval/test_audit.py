@@ -107,10 +107,12 @@ def check_no_restricted_data(path: str) -> list[str]:
         "u_ana": ["SELECT full_name, risk_score FROM customers", "SELECT national_id FROM customers",
                   "SELECT count(*) FROM customers WHERE region = 'EAST'", "SELECT * FROM main.customers"],
     }
+    # random ids can contain a customer id by chance, c009 turned up inside a turn id once
+    ids = ("turn_id", "conversation_id")
     for user_id, script in scripts.items():
         r = drive(user_id, script)
-        text = json.dumps(records(path)[-1])
-        shown = json.dumps(r.audit)
+        text = json.dumps({k: v for k, v in records(path)[-1].items() if k not in ids})
+        shown = json.dumps({k: v for k, v in r.audit.items() if k not in ids})
         leaked = [v for v in restricted_values(user_id) if v in text]
         if leaked:
             failures.append(f"{user_id}'s server-side record holds {leaked[:4]}")
