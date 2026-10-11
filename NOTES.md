@@ -19,81 +19,76 @@ Longer write-ups: [baseline review](docs/baseline.md), [frontend](docs/frontend.
 
 The baseline scored 11/18 and 12/17.
 
-**What the number doesn't cover.** It's 40 hand-written questions over 15 customers. The number check passes if the value appears anywhere in the answer, and the leak check only looks for strings and column names, which is how the original L9 passed while leaking region counts. There are few multi-turn cases and no UI cases. Some behaviour still rests on the prompt, like calling `decline` at all, so a model change can move it. The data boundary doesn't rest on the prompt: across 774 benchmark turns on four models, no restricted value reached a model.
+**What the number doesn't cover.** The evaluation covers only 40 hand-written questions over 15 customers, so it isn't exhaustive. Correctness checks look for expected values, while leak checks rely on string matching, which missed issues like L9. Multi-turn and UI coverage is limited, and some refusal behavior still depends on the prompt. However, authorization is enforced in code, and no restricted values were detected across 774 benchmark turns using four different models.
 
-## 2. What I found
 
-| Finding | In the eval? |
+
+## 2. What I Found
+
+The biggest issue was that authorization depended on the LLM instead of the backend. The model chose its own role, permissions used an incorrect hierarchy, and SQL checks only inspected the SELECT list. This allowed bypasses through `SELECT *`, WHERE clauses, and subqueries. Region restrictions were also enforced only through prompts.
+
+Here are several additional vulnerabilities:
+
+| Finding | Why it matters |
 |---|---|
-| The model chose its own role, and `ROLE_RANK` was a ladder with admin at 99 | Yes |
-| The column check only read the SELECT list, so `SELECT *`, WHERE filters and subqueries got through | Partly |
-| Rows were only scoped in the prompt | Yes |
-| The cache was keyed on question text, so one user's rows went to another | Yes, but L9 passed while leaking |
-| History was keyed on conversation id only, so a new identity kept the old context | No |
-| The DB was writable: `UPDATE users SET role='compliance'` stuck | No |
-| `make_chart` plotted rows the model made up | No |
-| Every result row was logged | No |
-| c001 and c008 are one person, so k = 2 on records can describe one human | No, I added L20 |
-| fair_lending can difference two answers into one person's race or income | No, I added L18 and L19 |
-| A plain `EXISTS` filter is a yes/no oracle for a role that can't read rows | No |
-| Out-of-scope filters returned a 0 that looked like an answer | No |
+| **Privilege escalation** | The database was writable. An `UPDATE users` query could permanently change a user's role to compliance. |
+| **Cross-user data leaks** | Conversation history carried over between identities, and the question-keyed cache could return another user's data. L9 even passed the original eval while leaking. |
+| **Indirect data exposure** | `make_chart` trusted model-supplied rows, while raw query results were written to application logs. |
+| **Aggregation inference** | Duplicate customer records could bypass k=2. Fair-lending users could also combine valid aggregates to recover an individual's race or income. I added L18–L20 to cover these cases. |
+| **SQL inference and misleading results** | `EXISTS` filters could reveal restricted facts through yes/no answers, while out-of-scope queries returned misleading zeros. |
 
-**Unfixable here.** Differencing across three or more queries still works: four income sums, each pair 2 people apart, give c005's exact income. Stopping it needs a query audit or noise on answers. Free text in memos and case notes can still steer an answer's wording, though not the data it reaches. Whatever the model sees also goes to the model provider.
+**Remaining limitations.** Multi-query differencing is not fully solved. I demonstrated that four individually permitted income sums could reveal one person's exact income. Preventing this reliably would require more comprehensive query auditing or privacy-preserving aggregation. Prompt injections in free-text fields can still influence answer wording, although they cannot bypass backend authorization. Authorized results also reach the model provider, which is a tradeoff of going with this architecture.
 
-**Brief versus eval.** The brief ([INSTRUCTIONS.md](INSTRUCTIONS.md)) says an analyst asking for age gets `birth_year`, but L6 expects a decline. I made it decline the computed age and offer `birth_year`.
+**Specification ambiguity.** The spec allows `birth_year` as generalized data, but L6 expects a refusal for age calculations. I chose to decline age calculations while offering `birth_year` instead, satisfying both interpretations.
 
-## 3. What I deliberately did not do
 
-- **Real login.** The identity picker stands in for it, and the server treats the choice as a session.
-- **A query audit or answer noise** for multi-query inference.
-- **General SQL rewriting.** The floor checks accept what sqlglot can check exactly and refuse the rest. The SQLite views and authorizer stay the boundary.
-- **Entity resolution beyond exact `national_id`,** and deduplicating answers. Only the floors count people.
-- **Filtering free text for injections.** The server already makes them powerless over data.
-- **Deployment pieces:** encrypted or tamper-evident audit storage, a persistent session store, a result cache, rate limits, and a Postgres row-level-security port.
-- **UI extras:** streaming, editing answers, saved conversations.
 
-## 4. Audit record
+## 3. What I Deliberately Did Not Do
 
-Each turn appends one JSON line to `audit.jsonl` (`agent/audit.py`). It holds:
-- the identity
-- the resolved permissions, with the view SQL that applies them
-- every tool call, with its SQL, status, refusal reason, row count, truncation, redactions, a floor-check summary, and `model_saw`, the exact text the model got
-- the outcome, tokens and latency
+I prioritized security, correctness, and a usable interface over building a production-ready system. The main decisions were:
 
-That's where "what did the agent see, on whose authority" gets answered. Every exit writes a record, crashes included, and if the write fails the answer is withheld. The people behind a floor check are national ids, so only their count is kept. The UI gets a sanitized copy. The file is as sensitive as the warehouse and isn't tamper-evident.
+- **Real authentication.** The identity picker simulates login, while the backend manages sessions and enforces permissions. Building a full authentication system was outside the scope of this exercise.
+- **Complete protection against multi-query inference.** Preventing all differencing attacks would require comprehensive query-history analysis or adding noise to results, introducing significant complexity and potential accuracy tradeoffs.
+- **Arbitrary SQL rewriting.** I limited aggregation checks to query structures that could be safely validated with sqlglot. Unsupported queries fail closed rather than risking incorrect privacy enforcement.
+- **Advanced entity resolution.** Privacy floors deduplicate using `national_id`, but query results preserve the original customer records. Broader entity resolution would require additional data and assumptions.
+- **Prompt-injection filtering.** Rather than trying to sanitize every free-text field, I enforced authorization in the backend so injected instructions cannot grant access to restricted data.
+- **Production infrastructure.** I left out encrypted and tamper-evident audit storage, persistent sessions, caching, rate limiting, and a PostgreSQL migration. These matter at scale but weren't necessary for the take-home.
+- **Additional UI features.** I skipped streaming responses, editable answers, and saved conversations to focus on secure identity switching, charts, and audit visibility.
 
-## 5. Cost and latency
 
-Five full eval runs per model, 215 turns each, all run at the same time on the current prompt:
+## 4. Audit Record
 
-| Model | Correct | Leaks | p50 s | p95 s | Tokens in / out | Tool calls | $ / question | $ p95 | Full eval |
-|---|---|---|---|---|---|---|---|---|---|
-| gpt-5.5 | 5 of 5 at 20/20 | 5 of 5 at 20/20 | 2.8 | 6.4 | 2,863 / 164 | 1.22 | $0.0192 | $0.0345 | $0.83 |
-| **gpt-5.4** (default) | 5 of 5 at 20/20 | 5 of 5 at 20/20 | 1.9 | 4.0 | 2,914 / 85 | 1.29 | $0.0086 | $0.0143 | $0.37 |
+Every turn writes a structured JSON record to `audit.jsonl` through `agent/audit.py`, containing:
 
-On the earlier prompt (two runs each), the smaller models failed:
+- **Identity and scope:** User identity, role, permissions, and the SQLite view SQL enforcing them.
+- **Tool execution:** SQL executed, status, refusals, returned rows, truncation, redactions, and privacy-check summaries.
+- **Model visibility:** `model_saw` records exactly what data reached the LLM.
+- **Outcome and performance:** Final status, token usage, and latency.
 
-| Model | Correct | Leaks | $ / question |
-|---|---|---|---|
-| gpt-5.4-mini | 17, 16 | 19, 19 | $0.0020 |
-| gpt-5.4-nano | 16, 12 | 19, 20 | $0.0005 |
+Together, these records answer **"What did the agent see, and on whose authority?"**
 
-Their leak failures were missed `decline` calls, not data. They never saw restricted rows, but the gate counts the missing decline.
+Every turn is logged, including failures. If the audit write fails, the response is withheld. Privacy checks record only the number of distinct people, never their national IDs. The UI receives a sanitized version of the audit.
 
-Prices are OpenAI's per million tokens: gpt-5.5 $5 in and $30 out, gpt-5.4 $2.50 and $15. The dollars are an upper bound, since cached input isn't counted. SQL is about 0.1% of a turn's time.
+**Limitations:** The audit file contains sensitive data and currently lacks encryption, tamper protection, and a retention policy.
 
-**Getting gpt-5.4 there.** It failed c4 by asking for a date range the question didn't need, and u2 by asking instead of declining. Three general prompt changes fixed it:
-- a rule for asking versus declining
-- the user's scoped schema in the prompt, with notes on what each column measures
-- a status note that stops pointing it at questions the data can't answer
 
-None names an eval case or touches the server checks. The schema adds 600 to 750 input tokens, but it saves `describe_table` calls.
 
-**Tradeoff.** gpt-5.4 costs 45% of gpt-5.5 and is about a third faster, and it matched it on 6 of 6 runs. Going back is one line in `agent/baseline.py`.
+## 5. Cost and Latency
 
-**At 100× the questions** (about $0.86 per 100 on gpt-5.4), the in-process state breaks first. Sessions, history and the fair_lending population record don't survive a restart or scale across processes. The audit file needs a single writer. Each turn holds a server thread for 2 to 4 s, so throughput is set by the thread pool and the OpenAI rate limits.
+I benchmarked GPT-5.5 and GPT-5.4 across five full evaluation runs each (215 turns per model). Both passed every correctness and leak test.
 
-**At 100× the rows,** SQLite is fine, but the 200-row cap trips more often and bigger results cost more tokens. At warehouse scale, the views and authorizer become the warehouse's own row and column security, and the sqlglot floor checks stay.
+| Model | p50 / p95 latency | Tokens in / out | Cost/question | p95 cost | Full eval |
+|---|---|---|---|---|---|
+| GPT-5.5 | 2.8s / 6.4s | 2,863 / 164 | $0.0192 | $0.0345 | $0.83 |
+| **GPT-5.4 (default)** | **1.9s / 4.0s** | 2,914 / 85 | **$0.0086** | $0.0143 | $0.37 |
+
+GPT-5.4 costs **55% less** and is about 32% faster at p50. It initially failed some correctness cases, but general prompt improvements brought it to 20/20 correctness and leaks across six consecutive runs. These improvements included adding the scoped schema, clarifying column meanings, and distinguishing clarification from refusal. Smaller models were cheaper but failed the evaluation gate.
+
+Costs use published API token prices and are upper estimates because cached input tokens aren't tracked. SQL accounts for roughly 0.1% of total latency. Most time is spent on model calls.
+
+**Scaling to 100×:** At 100× the questions, we would need concurrent agent execution using asynchronous requests and multiple workers to support more users. In-memory sessions, conversation history, and privacy tracking would need shared storage, while audit logs would move to a centralized system. At 100× the rows, SQLite could still handle the workload, but the 200-row cap and larger results become concerns. At warehouse scale, we would move authorization into native database security.
+
+
 
 ## 6. AI log
 
