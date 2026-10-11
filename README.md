@@ -1,184 +1,110 @@
-# Take-home: role-aware conversational BI
+# Role-aware conversational BI
 
 ![Role-aware BI architecture](docs/diagrams/architecture.png)
 
-Identity comes from a server session, the model only writes SQL, and every query goes through scoped views, an authorizer and privacy checks before any row reaches the model. The write-up is in [NOTES.md](NOTES.md). The diagram's source is [docs/diagrams/architecture.html](docs/diagrams/architecture.html).
+A chat interface over a small fraud-operations warehouse. You pick who you are, ask a question in plain language, and the agent answers with numbers, tables and charts. It only uses data that identity is allowed to see. The model writes SQL, but it never decides permissions, and restricted rows never reach it.
 
----
+The original take-home brief is in [INSTRUCTIONS.md](INSTRUCTIONS.md). The write-up for reviewers, with the scorecard, findings, costs and AI log, is in [NOTES.md](NOTES.md).
 
-**Time: 4-8 hours.** It is a cap, not a target.  Tell us where you stopped and why.
+## How access is enforced
 
-**Use AI tooling.** Claude Code, Cursor, whatever you normally use — we do. We ask for
-your prompts and where you overrode the model (see Deliverables). That part is not a
-formality; it is one of the things we read most carefully.
+| Layer | What it does | Code |
+|---|---|---|
+| Identity | Picking a user creates a server session. The model has no role parameter, so it can't claim one | `app/server.py`, `agent/policy.py` |
+| Scoped views | Each table the user may see is a temp view that already filters rows (region, active customers) and drops columns they can't see | `agent/policy.py`, `agent/db.py` |
+| Authorizer | A read-only connection that refuses raw tables, writes, PRAGMA and ATTACH. Limits of 2 s, 200 rows and 1 MB per value | `agent/db.py` |
+| Privacy floors | sqlglot checks aggregates: at least 2 people, protected-class breakdowns need 10 people with 3 per cell, and fair_lending can't subtract two answers to isolate someone. Shapes it can't check fail closed | `agent/disclosure.py` |
+| Charts | Built on the server from the last authorized query result. The model only names two columns | `agent/charts.py` |
+| Audit | One JSON line per turn: identity, permissions, SQL, the rows the model saw, redactions. The UI gets a sanitized copy | `agent/audit.py` |
 
----
+## The interface
 
-## What this is
+- **Identity picker.** Switching starts a new session and conversation. It clears the thread, the panel and any draft, and drops any answer still in flight.
+- **Thread with follow-ups.** Answers come with result tables, and with charts when you ask for one. Suppressed cells show as `<3`.
+- **Distinct outcomes.** A refusal (amber, with the server's reason), an empty result ("no matching rows in your scope"), a clarifying question and an error each look different.
+- **"What the agent did" panel.** Who the answer ran as, the permissions used, every query with its status, and anything refused or redacted.
 
-`agent/` contains a working conversational-BI agent over a small fraud-operations
-warehouse. Users ask questions in plain language; it writes SQL, reads rows, and answers.
-It runs. It is also wrong in ways that matter.
+The design write-up is in [docs/frontend.md](docs/frontend.md).
 
-Different users have different roles and are entitled to different data. **The core of
-this exercise is where that entitlement is enforced.** Everything else is secondary, and
-we have said so in the rubric below.
+## Running it
 
-## Setup
+Needs Python 3.10+ and Node 20.19+. Run everything from the repo root unless a step says otherwise.
+
+**Setup, once.** The venv needs Python 3.10+. macOS's default `python3` may be 3.9. With a Python 3.12 on your PATH:
 
 ```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
-python seed.py
-export OPENAI_API_KEY=...          # 
-python eval/run_eval.py --ids c2      # smoke test: one question, ~15s
-python eval/run_eval.py               # full suite, ~36 agent runs
 ```
 
-The key is yours for the exercise and has a fixed budget. Keep it out of anything you send
-back.
+Or with [uv](https://docs.astral.sh/uv/), which fetches Python 3.12 itself:
 
-The model is a one-line constant in `agent/baseline.py`; `gpt-5.5` is only a default.
-Use whichever model you prefer — nothing here is tuned to a particular one, and if you
-would rather point it at another provider with your own key, that is fine too.
+```bash
+uv venv --python 3.12 .venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+```
 
-## The data
+Then:
 
-Five tables — `users`, `customers`, `transactions`, `alerts`, `case_notes`. Read
-`seed.py`; it is the schema and the fixture in one file. A few things worth knowing up
-front, because they are properties of the domain rather than puzzles:
+```bash
+python seed.py
+cp .env.example .env
+```
 
-- `transactions.amount_minor` is in **minor units** (cents, centavos).
-- All timestamps are **UTC**.
-- `customers.deleted_at` is a **soft delete**. Offboarded customers are not current
-  customers.
-- More than one currency is present and there is **no FX table**.
+Then put your OpenAI key in `.env`.
 
-Everything else in the data, you should discover.
+**Backend, terminal 1.** Activate the venv in every new terminal:
 
-## The permission model
+```bash
+source .venv/bin/activate
+set -a && . ./.env && set +a
+uvicorn app.server:app --port 8000
+```
 
-This is the specification. Implement it exactly; do not infer a hierarchy that isn't
-written here. **The columns are tiered, and the tiers are not a ladder.**
+**Frontend, terminal 2:**
 
-| Tier | Columns |
+```bash
+cd web
+npm install
+npm run dev
+```
+
+Open http://localhost:5173, pick an identity and ask a question. The dev server forwards `/api` to the backend on port 8000.
+
+**One port instead.** Run `cd web && npm run build`, start the backend, and open http://localhost:8000. uvicorn serves the built UI itself.
+
+## Results
+
+| Check | Result |
 |---|---|
-| **T0** open | `customer_id`, `full_name`, `region`, `segment`, `risk_score`, `onboarded_at`, `deleted_at` |
-| **T1** generalized | `zip3`, `birth_year`, `income_band` |
-| **T2** precise quasi-identifier | `zip_code`, `dob` |
-| **T3** financial detail | `annual_income_usd` |
-| **T4** direct identifier | `national_id`, `email`, `phone` |
-| **T5** protected class | `race`, `ethnicity`, `sex` |
+| Model eval, correctness | 20/20 (baseline 11/18) |
+| Model eval, leaks | 20/20 (baseline 12/17) |
+| Consistency | 5 of 5 full runs clean on both gpt-5.4 and gpt-5.5 |
+| Offline suites | scope 97/97, audit 6/6, charts 10/10, server 13/13, web 14/14 |
+| Default model | gpt-5.4: $0.0086 per question, 1.9 s p50. gpt-5.5 is $0.0192 and 2.8 s |
 
-| Role | Rows | T0 | T1 | T2 | T3 | T4 | T5 | `case_notes` |
-|---|---|---|---|---|---|---|---|---|
-| `analyst` | own region, active only | ✓ | ✓ | ✗ | ✗ | ✗ | ✗ | ✗ |
-| `reviewer` | own region, active only | ✓ | ✓ | ✓ | ✓ | ✗ | ✗ | ✓ |
-| `compliance` | all regions, incl. offboarded | ✓ | ✓ | ✓ | ✓ | ✓ | **✗** | ✓ |
-| `fair_lending` | all regions, active, **aggregate only** | region & segment only | ✓ | ✗ | ✓ | ✗ | ✓ | ✗ |
-| `admin` | **none** — schema, `users`, system state | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ | ✗ |
+To run them, with the venv active:
+- `python eval/run_eval.py` runs the model eval and needs the key.
+- `python eval/test_scope.py`, `test_audit.py`, `test_charts.py` and `test_server.py` run offline.
+- `cd web && npm test` runs the frontend tests.
 
-Three things in that table are deliberate and worth reading twice.
+## Repo map
 
-**T1 is a generalization, not a denial.** An analyst asking for a customer's zip should
-get `zip3`; asking for age should get `birth_year`; asking about income should get
-`income_band`. Returning a coarser value is a different behaviour from refusing, and both
-are correct in different places.
-
-**Protected class is purpose-limited, not privilege-gated.** `race`, `ethnicity` and `sex`
-are collected for fair-lending monitoring, and may be used for nothing else. `compliance`
-outranks every other role on every other column and still cannot touch T5 — their purpose
-is investigation. `fair_lending` is the only role that can, and it is simultaneously the
-*only* role that may never see a `customer_id` or a `full_name`. Any implementation that
-ranks roles on a single axis cannot express this table.
-
-**`admin` is an operations account.** Schema, `users`, and system state. Never a customer
-record, never a transaction row. Not a superuser.
-
-### Two disclosure floors
-
-**Customer aggregates (k = 2).** An aggregate over `customers` is refused when it derives
-from fewer than 2 distinct customers — a count or average resolving to one person
-identifies that person. Applies to customer-attribute aggregates, not to transaction or
-alert totals, which are business metrics.
-
-**Protected-class aggregates (fair-lending reporting rule).** A T5 breakdown may be
-reported only when the population being broken down is at least 10 customers **and** every
-reported cell has at least 3. Cells below 3 are suppressed rather than reported — but if
-suppression still allows a suppressed cell to be derived (because too few cells were
-suppressed, or the attribute has only two categories and the total is known), the whole
-breakdown must be refused instead.
-
-*k* = 2 is low because the fixture is small; production would use 5–20. The mechanism is
-what is being tested, not the constant.
-
-**Refusing is not the same as returning nothing.** A user who is told "0 customers match"
-when the real answer is "you may not see that region" has been given a false answer, and
-will act on it. Refusals should say that access is the reason.
-
-## What a leak means
-
-**A leak is restricted data entering the model's context — not merely appearing in the
-final answer.** If a tool returns rows the user is not entitled to and the model then
-politely omits them, that is a leak. The model is not a trust boundary: text it reads can
-carry instructions, its output is not guaranteed, and everything it sees lands in your
-logs and traces.
-
-`eval/run_eval.py` enforces this by scanning the entire transcript — every tool result and
-every argument passed to `make_chart` — for values the acting user is not entitled to.
-
-## Your task
-
-1. **Find and fix the ways this agent discloses data it shouldn't.** `eval/leaks.yaml` has
-   seventeen cases. They are not exhaustive; we planted more problems than we test for,
-   and finding an untested one is worth more than fixing a tested one.
-2. **Do not break correctness while locking it down.** Over-filtering is the easy wrong
-   answer: an agent that reports a confidently wrong total is worse than one that leaks,
-   because nobody can tell. `eval/questions.yaml` is the counterweight. It does not start
-   clean, so not every failure there is one you caused. Several of its answers are not what
-   a first-pass query returns.
-3. **Extend the eval.** Add the cases you think are missing. We will read what you added
-   more closely than what you fixed.
-4. **Give it a face.** Right now this is a library with a CLI harness; there is no way to
-   sit with it. Build a chat interface — pick an identity, ask a question, ask a follow-up,
-   and see what the agent did on your behalf. A user should be able to ask for a chart or
-   graph, and the interface should render it. What belongs on that screen is a judgement
-   call.
-
-## Deliverables
-
-A branch or patch, plus a `NOTES.md` of about two pages:
-
-1. **Scorecard.** The output of `python eval/run_eval.py`, and one honest paragraph on
-   what your number does *not* cover.
-2. **What you found**, including anything the eval doesn't test — and anything you
-   believe is unfixable in the current design, with the reason.
-3. **What you deliberately did not do**, and why. This section carries real weight.
-4. **The audit record.** Emit, per turn, the identity, the resolved access scope, the SQL
-   actually executed, rows returned, and redactions applied. A bank's regulator asks
-   "what did the agent see, on whose authority?" — show us where that answer comes from.
-5. **Cost and latency.** p50 and p95 seconds per question, tokens and dollars per
-   question, and one paragraph on what breaks at 100× the questions and 100× the rows.
-6. **AI log.** The prompts you used, the places the model was wrong, and what you
-   overrode.
-7. **The interface.** How to run it, what you chose to put on the screen, and what you
-   left off. The stack is yours — reach for whatever you would actually reach for, charting
-   library included.
-8. **A walkthrough.** A brief screen recording showing the implementation working and also summarizing the solution design and architecture
-
-## How we score it
-
-Published so you can aim at it rather than guess.
-
-| Weight | |
+| Path | What it is |
 |---|---|
-| **gate** | `eval/run_eval.py --only leaks` is clean. Zero points; you cannot pass without it. |
-| **25** | Where enforcement lives, and whether it survives an attacker-controlled input |
-| **10** | The leak classes you found that we don't test for — and the ones you correctly call unfixable |
-| **15** | Correctness held up under lockdown; the eval cases you added |
-| **5** | Tool and error contracts — what a tool accepts, what it returns on refusal |
-| **30** | The interface: what you chose to show, especially how a result is presented (graphs, tables, charts etc..), what happens to context when the identity changes, and whether a refusal reads differently from an empty result |
-| **5** | The audit record |
-| **10** | `NOTES.md`: what you cut, what your number doesn't cover, cost at 100× |
+| `agent/` | The agent loop (`baseline.py`), the permission table (`policy.py`), the database boundary (`db.py`), privacy floors (`disclosure.py`), charts and the audit record |
+| `app/server.py` | FastAPI: sessions and the chat API |
+| `web/` | The React UI |
+| `eval/` | The model eval (`questions.yaml`, `leaks.yaml`) and the offline suites |
+| `docs/` | [Baseline review](docs/baseline.md), [frontend design](docs/frontend.md), [known limitations](docs/limitations.md), [AI log](docs/ai-log.md), [diagram source](docs/diagrams/architecture.html) |
+| `seed.py` | Builds `fraud.db`, the fixture |
 
-We are not scoring lines of code or test count. A framework on the agent has to earn its
-place; on the interface, use whatever you like.
+## Known limitations
+
+- fair_lending can still isolate someone by combining three or more answers. Stopping that would need a query audit or noise on every answer.
+- The audit file holds the rows the model saw, isn't tamper-evident, and has no retention policy.
+- Sessions, history and the fair_lending population record live in process memory, so a restart clears them.
+
+The full list is in [docs/limitations.md](docs/limitations.md).

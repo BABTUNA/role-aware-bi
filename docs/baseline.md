@@ -66,7 +66,7 @@ users     ◄── case_notes.author_id
 | Table | Notes |
 |---|---|
 | `users` | 6 rows: user_id, role, region |
-| `customers` | 15 rows, 2 offboarded. Columns T0 to T5 per the README |
+| `customers` | 15 rows, 2 offboarded. Columns T0 to T5 per the brief (`INSTRUCTIONS.md`) |
 | `transactions` | 19 rows. Cents, UTC, USD/EUR/MXN |
 | `alerts` | 14 rows. `status` has mixed case |
 | `case_notes` | 5 rows of free text |

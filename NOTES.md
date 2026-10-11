@@ -40,7 +40,7 @@ The baseline scored 11/18 and 12/17.
 
 **Unfixable here.** Differencing across three or more queries still works: four income sums, each pair 2 people apart, give c005's exact income. Stopping it needs a query audit or noise on answers. Free text in memos and case notes can still steer an answer's wording, though not the data it reaches. Whatever the model sees also goes to the model provider.
 
-**README versus eval.** The README says an analyst asking for age gets `birth_year`, but L6 expects a decline. I made it decline the computed age and offer `birth_year`.
+**Brief versus eval.** The brief ([INSTRUCTIONS.md](INSTRUCTIONS.md)) says an analyst asking for age gets `birth_year`, but L6 expects a decline. I made it decline the computed age and offer `birth_year`.
 
 ## 3. What I deliberately did not do
 

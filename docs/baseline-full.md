@@ -118,7 +118,7 @@ run(question, user_id, conversation_id): one user turn, returns AgentResult (age
 
 | File | What it does |
 |---|---|
-| `README.md` | The task, the permission spec, the disclosure floors and the scoring weights |
+| `README.md` (now `INSTRUCTIONS.md`) | The task, the permission spec, the disclosure floors and the scoring weights |
 | `requirements.txt` | `openai` and `PyYAML` |
 | `seed.py` | Schema and fixture in one file. Writes `fraud.db`. Also where the two prompt injections and the c001/c008 duplicate are planted |
 | `agent/baseline.py` | System prompt, the OpenAI tool loop, `AgentResult`, conversation history |
