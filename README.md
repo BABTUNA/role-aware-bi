@@ -4,6 +4,8 @@ A chat interface over a small fraud-operations warehouse. You pick who you are, 
 
 The original take-home brief is in [INSTRUCTIONS.md](INSTRUCTIONS.md). The write-up for reviewers, with the scorecard, findings, costs and AI log, is in [NOTES.md](NOTES.md).
 
+**Walkthrough video:** [youtu.be/7A4DaYqWH4k](https://youtu.be/7A4DaYqWH4k)
+
 ![Role-aware BI architecture](docs/diagrams/architecture.png)
 
 ## One request, end to end

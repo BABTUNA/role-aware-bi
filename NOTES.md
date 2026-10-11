@@ -92,27 +92,23 @@ Costs use published API token prices and are upper estimates because cached inpu
 
 ## 6. AI log
 
-Built with Claude Code over one session of 28 prompts, every one listed word for word in [docs/ai-log.md](docs/ai-log.md).
+I built this with Claude Code in one session of 44 prompts. The prompts are listed in [docs/ai-log.md](docs/ai-log.md), and the whole conversation is in [docs/transcript.md](docs/transcript.md).
 
-**I overrode it:**
-- I deferred the k = 2 floor until identity and the authorizer were right.
-- I put the floors before isolation.
-- I ruled out a general SQL rewriter.
-- I stopped the security work at two-query differencing.
-- I made the UI get a sanitized audit record.
-- I required checking exit codes and stderr instead of trusting summaries.
-- I had it fix gpt-5.4 rather than settle for gpt-5.5.
+- **Where I overrode it,** on scope and order:
+  - the k = 2 floor waited until identity and the authorizer worked
+  - floors came before isolation
+  - no general SQL rewriter
+  - security stopped at two-query differencing
+  - the UI gets a sanitized audit
+  - every exit code and stderr gets checked
+  - it had to fix gpt-5.4 instead of settling for gpt-5.5
+- **Where it was wrong:**
+  - its first authorizer blocked its own views
+  - three of its prompt notes misled the models
+  - it reported a crashing test file and an empty secrets scan as passing
 
-**It was wrong:**
-- Its first authorizer blocked its own views.
-- It proposed a fair_lending filter rule that would have been an oracle, and caught that before shipping.
-- Three of its prompt notes misled the models: "keep it short" broke t3, a status note made gpt-5.4 ask instead of decline, and a column-matching rule made gpt-5.4 answer "credit score" with `risk_score`.
-- It committed a test file that crashed on start and reported it as passing.
-- It ran a secrets scan that read zero files.
-
-Exit-code checks and two review agents caught most of these.
-
-**The agent model was wrong in the baseline:** gpt-5.5 claimed `admin` or `compliance` whenever it was refused, answered "0 yesterday", added EUR to USD, and missed the mixed-case alert statuses.
+  Exit-code checks and two review agents caught these.
+- **Where gpt-5.5 was wrong in the baseline:** it claimed `admin` or `compliance` after being refused, answered "0 yesterday", added EUR to USD, and missed the mixed-case statuses.
 
 ## 7. The interface
 
@@ -135,4 +131,4 @@ cd web && npm install && npm run dev    # http://localhost:5173
 
 ## 8. Walkthrough
 
-Recording: *(link)*.
+Recording: [youtu.be/7A4DaYqWH4k](https://youtu.be/7A4DaYqWH4k)
