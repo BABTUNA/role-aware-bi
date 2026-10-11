@@ -2,6 +2,8 @@
 
 Longer write-ups: [baseline review](docs/baseline.md), [frontend](docs/frontend.md), [known limitations](docs/limitations.md), [AI log with every prompt](docs/ai-log.md).
 
+**Where I stopped.** I spent about 7 hours. I stopped once both suites passed on repeated runs and the interface, audit record and notes were done. What I'd do next is close the multi-query differencing gap for fair_lending, with a query audit or answer noise, and move sessions and the audit log out of process memory and the local file.
+
 ## 1. Scorecard
 
 `python eval/run_eval.py` with the default model (`gpt-5.4`), exit 0:
