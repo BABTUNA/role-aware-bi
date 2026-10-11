@@ -98,7 +98,7 @@ To run them, with the venv active:
 | `app/server.py` | FastAPI: sessions and the chat API |
 | `web/` | The React UI |
 | `eval/` | The model eval (`questions.yaml`, `leaks.yaml`) and the offline suites |
-| `docs/` | [Baseline review](docs/baseline.md), [frontend design](docs/frontend.md), [known limitations](docs/limitations.md), [AI log](docs/ai-log.md), [diagram source](docs/diagrams/architecture.html) |
+| `docs/` | [Backend now](docs/backend.md), [baseline review](docs/baseline.md), [frontend design](docs/frontend.md), [known limitations](docs/limitations.md), [AI log](docs/ai-log.md), [diagram source](docs/diagrams/architecture.html) |
 | `seed.py` | Builds `fraud.db`, the fixture |
 
 ## Known limitations
