@@ -7,6 +7,7 @@ import {
   Loader2,
   Lock,
   MessageCircleQuestion,
+  PanelRightClose,
   ShieldCheck,
   TableProperties,
   X,
@@ -99,7 +100,15 @@ function StepItem({ step, last, previous }: { step: Step; last: boolean; previou
   )
 }
 
-export default function ActivityPanel({ turn, onClose }: { turn: Turn | null; onClose?: () => void }) {
+type Props = {
+  turn: Turn | null
+  // the slide-over on narrow screens closes
+  onClose?: () => void
+  // the side panel on wide screens collapses to a rail
+  onCollapse?: () => void
+}
+
+export default function ActivityPanel({ turn, onClose, onCollapse }: Props) {
   const audit = turn?.response?.audit
 
   return (
@@ -120,6 +129,17 @@ export default function ActivityPanel({ turn, onClose }: { turn: Turn | null; on
             className={`${audit ? "ml-1" : "ml-auto"} rounded-md p-2 text-slate-500 hover:bg-slate-100 lg:hidden`}
           >
             <X className="h-4 w-4" />
+          </button>
+        )}
+        {onCollapse && (
+          <button
+            type="button"
+            onClick={onCollapse}
+            aria-label="Collapse panel"
+            title="Collapse"
+            className={`${audit ? "ml-1" : "ml-auto"} -my-1 hidden rounded-md p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 lg:inline-flex`}
+          >
+            <PanelRightClose className="h-4 w-4" />
           </button>
         )}
       </header>

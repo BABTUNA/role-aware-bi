@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react"
-import { PanelRight, RotateCcw, ShieldCheck } from "lucide-react"
+import { PanelRight, PanelRightOpen, RotateCcw, ShieldCheck } from "lucide-react"
 import { ApiError, api } from "./api"
 import { initialState, reducer } from "./state"
 import type { Identity, SessionInfo, Turn } from "./types"
@@ -20,8 +20,18 @@ function restore(): Promise<SessionInfo | null> {
   return restoring
 }
 
-// below lg the panel is a slide-over, at lg and up it is always on screen
+// below lg the panel is a slide-over, at lg and up it sits on the right and can collapse to a rail
 const narrow = () => window.matchMedia("(max-width: 1023px)").matches
+
+// the collapsed choice is a per-browser convenience, storage can be missing or blocked
+const COLLAPSED_KEY = "fraud-bi.panel-collapsed"
+function readCollapsed(): boolean {
+  try {
+    return localStorage.getItem(COLLAPSED_KEY) === "1"
+  } catch {
+    return false
+  }
+}
 
 function Drawer({ turn, onClose }: { turn: Turn | null; onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null)
@@ -61,6 +71,7 @@ export default function App() {
   const [switching, setSwitching] = useState(false)
   const [booted, setBooted] = useState(false)
   const [panelOpen, setPanelOpen] = useState(false)
+  const [collapsed, setCollapsed] = useState(readCollapsed)
   const [problem, setProblem] = useState<string | null>(null)
   // async callbacks read the latest state through this, never a stale closure
   const latest = useRef(state)
@@ -68,6 +79,14 @@ export default function App() {
   const inflight = useRef<AbortController | null>(null)
   // stable, the drawer's focus handling runs once per opening
   const closePanel = useCallback(() => setPanelOpen(false), [])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(COLLAPSED_KEY, collapsed ? "1" : "0")
+    } catch {
+      // nothing to do, the panel just won't remember next time
+    }
+  }, [collapsed])
 
   useEffect(() => {
     api.users().then(setUsers).catch(() => setProblem("Can't reach the server. Is uvicorn running?"))
@@ -154,8 +173,9 @@ export default function App() {
 
   const select = (id: string) => {
     dispatch({ type: "select", id })
-    // on wide screens the panel is already showing, only narrow screens open the slide-over
+    // narrow screens open the slide-over, wide screens bring a collapsed panel back
     if (narrow()) setPanelOpen(true)
+    else setCollapsed(false)
   }
 
   const session = state.session
@@ -248,9 +268,27 @@ export default function App() {
         </section>
 
         {session && (
-          <aside className="hidden w-[400px] shrink-0 border-l border-slate-200 bg-white lg:block xl:w-[440px]">
-            {/* keyed by turn, so scroll position and open details reset for each answer */}
-            <ActivityPanel key={selectedTurn?.id ?? "none"} turn={selectedTurn} />
+          <aside
+            className={`hidden shrink-0 overflow-hidden border-l border-slate-200 bg-white transition-[width] duration-200 lg:block ${
+              collapsed ? "w-12" : "w-[400px] xl:w-[440px]"
+            }`}
+          >
+            {collapsed ? (
+              <button
+                type="button"
+                onClick={() => setCollapsed(false)}
+                aria-label="Show what the agent did"
+                aria-expanded={false}
+                title="Show what the agent did"
+                className="flex h-full w-full flex-col items-center gap-3 pt-4 text-slate-500 transition hover:bg-slate-50 hover:text-slate-700"
+              >
+                <PanelRightOpen className="h-4 w-4" />
+                <span className="whitespace-nowrap text-xs font-medium [writing-mode:vertical-rl]">What the agent did</span>
+              </button>
+            ) : (
+              // keyed by turn, so scroll position and open details reset for each answer
+              <ActivityPanel key={selectedTurn?.id ?? "none"} turn={selectedTurn} onCollapse={() => setCollapsed(true)} />
+            )}
           </aside>
         )}
       </main>
