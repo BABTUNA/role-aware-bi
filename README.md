@@ -1,10 +1,27 @@
 # Role-aware conversational BI
 
-![Role-aware BI architecture](docs/diagrams/architecture.png)
-
 A chat interface over a small fraud-operations warehouse. You pick who you are, ask a question in plain language, and the agent answers with numbers, tables and charts. It only uses data that identity is allowed to see. The model writes SQL, but it never decides permissions, and restricted rows never reach it.
 
 The original take-home brief is in [INSTRUCTIONS.md](INSTRUCTIONS.md). The write-up for reviewers, with the scorecard, findings, costs and AI log, is in [NOTES.md](NOTES.md).
+
+![Role-aware BI architecture](docs/diagrams/architecture.png)
+
+## One request, end to end
+
+Ana is an analyst for WEST. She asks: *"What's the average risk score of customers in my region?"*
+
+1. **Identity.** FastAPI reads her session cookie and resolves her scope from the users table: analyst, WEST, active customers only, T0 and T1 columns. Neither the browser nor the model can change it.
+2. **SQL.** The model writes `SELECT AVG(risk_score) AS avg_risk_score FROM customers`. It has no region filter, and it doesn't need one.
+3. **Scoped view.** `customers` resolves to a temp view built for Ana, holding only active WEST customers and the columns she may see. A query against `main.customers` directly is refused by the authorizer.
+4. **Privacy floor.** sqlglot sees an aggregate over customers and counts the people behind it: 6, above the floor of 2. The same average over one customer (`WHERE risk_score > 90`) would come back as a refusal.
+5. **Result.** The model is shown only this, and answers "The average risk score for active WEST customers is 60.5":
+   ```
+   1 row(s)
+   avg_risk_score
+   60.5
+   scope: region WEST only, active customers only
+   ```
+6. **Audit.** The turn's record keeps her identity and permissions, the SQL, the floor check, what the model was shown, and any refusals or redactions. The "What the agent did" panel shows a sanitized copy.
 
 ## How access is enforced
 
